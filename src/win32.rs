@@ -240,6 +240,10 @@ impl LongCaptureWorker {
         }
         responses
     }
+
+    fn wait_for_response(&self, timeout: Duration) -> Option<LongCaptureResponse> {
+        self.response_rx.recv_timeout(timeout).ok()
+    }
 }
 
 pub fn run() -> i32 {
@@ -1097,11 +1101,9 @@ impl Application {
             }
             ToolButtonType::Undo => self.command_history.undo(&mut self.annotations),
             ToolButtonType::Save => {
-                self.finish_long_screenshot_mode();
                 self.save_to_file();
             }
             ToolButtonType::Copy | ToolButtonType::Confirm => {
-                self.finish_long_screenshot_mode();
                 self.save_to_clipboard();
             }
             ToolButtonType::Cancel => self.cancel_session(),
@@ -1259,20 +1261,6 @@ impl Application {
             self.long_source_region.h
         ));
         true
-    }
-
-    fn finish_long_screenshot_mode(&mut self) {
-        if self.is_long_capture_active {
-            self.is_long_capture_active = false;
-            self.long_auto_scroll_active = false;
-            self.long_auto_stalls = 0;
-            self.pending_long_frame_capture = false;
-            self.long_needs_trailing_capture = false;
-            self.long_capture_generation = self.long_capture_generation.saturating_add(1);
-            self.long_capture_in_flight = false;
-            self.set_passthrough_region(None, Vec::new());
-            self.build_toolbar();
-        }
     }
 
     fn forward_long_scroll(&mut self, wheel_delta: i32, local_point: Point) -> bool {
@@ -1465,24 +1453,92 @@ impl Application {
             .unwrap_or_default();
 
         for response in responses {
-            if !self.long_capture_in_flight
-                || response.generation != self.long_capture_generation
-                || response.seq != self.long_capture_in_flight_seq
-            {
-                continue;
+            self.handle_long_capture_response(response);
+        }
+    }
+
+    fn wait_for_long_capture_response(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.long_capture_in_flight {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
             }
 
-            self.long_capture_in_flight = false;
-            let needs_trailing = self.long_capture_in_flight_needs_trailing;
-            let trailing_due = self.long_capture_in_flight_trailing_due;
-            let appended = response
-                .frame
-                .map(|frame| self.append_long_screenshot_frame(frame))
-                .unwrap_or_else(|| {
-                    append_long_log("long-capture failed");
-                    false
-                });
-            self.finish_long_capture(appended, needs_trailing, trailing_due);
+            let response = self
+                .long_capture_worker
+                .as_ref()
+                .and_then(|worker| worker.wait_for_response(remaining));
+            let Some(response) = response else {
+                break;
+            };
+            self.handle_long_capture_response(response);
+        }
+    }
+
+    fn handle_long_capture_response(&mut self, response: LongCaptureResponse) {
+        if !self.long_capture_in_flight
+            || response.generation != self.long_capture_generation
+            || response.seq != self.long_capture_in_flight_seq
+        {
+            return;
+        }
+
+        self.long_capture_in_flight = false;
+        let needs_trailing = self.long_capture_in_flight_needs_trailing;
+        let trailing_due = self.long_capture_in_flight_trailing_due;
+        let appended = response
+            .frame
+            .map(|frame| self.append_long_screenshot_frame(frame))
+            .unwrap_or_else(|| {
+                append_long_log("long-capture failed");
+                false
+            });
+        self.finish_long_capture(appended, needs_trailing, trailing_due);
+    }
+
+    fn flush_long_capture_for_export(&mut self) {
+        if !self.is_long_capture_active {
+            return;
+        }
+
+        self.long_auto_scroll_active = false;
+        self.poll_long_capture_worker();
+        self.wait_for_long_capture_response(Duration::from_millis(500));
+
+        self.pending_long_frame_capture = false;
+        self.long_needs_trailing_capture = false;
+        self.long_capture_in_flight = false;
+        self.long_capture_generation = self.long_capture_generation.saturating_add(1);
+
+        let now = Instant::now();
+        self.long_scroll_seq = self.long_scroll_seq.saturating_add(1);
+        self.long_current_scroll_seq = self.long_scroll_seq;
+        self.long_pending_scroll_seq = self.long_scroll_seq;
+        self.long_current_scroll_at = now;
+        self.long_pending_scroll_at = now;
+        self.long_last_frame_capture = now;
+
+        let Some(source_region) = self.long_source_region.intersect(Rect {
+            x: 0,
+            y: 0,
+            w: self.screen_size.w,
+            h: self.screen_size.h,
+        }) else {
+            return;
+        };
+        if self.long_stitcher.height() + source_region.h >= LONG_MAX_OUTPUT_HEIGHT {
+            return;
+        }
+
+        let appended = capture_region(self.bounds, source_region)
+            .or_else(|| capture_covered_window(self.bounds, self.hwnd, source_region))
+            .map(|frame| self.append_long_screenshot_frame(frame))
+            .unwrap_or(false);
+        if appended {
+            self.refresh_long_preview();
         }
     }
 
@@ -1742,6 +1798,7 @@ impl Application {
     }
 
     fn save_to_clipboard(&mut self) -> bool {
+        self.flush_long_capture_for_export();
         let Some((pixels, width, height)) = self.render_output_pixels() else {
             return false;
         };
@@ -1754,6 +1811,7 @@ impl Application {
     }
 
     fn save_to_file(&mut self) -> bool {
+        self.flush_long_capture_for_export();
         let Some((pixels, width, height)) = self.render_output_pixels() else {
             return false;
         };
