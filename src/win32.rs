@@ -85,10 +85,10 @@ const TOOLBAR_GROUP_GAP: f32 = 12.0;
 const CORNER_R: f32 = 8.0;
 const BTN_CORNER_R: f32 = 6.0;
 const LONG_TOOLBAR_BTN_SIZE: f32 = 40.0;
-const LONG_CAPTURE_DELAY: Duration = Duration::from_millis(80);
-const LONG_NATIVE_CAPTURE_DELAY: Duration = Duration::from_millis(45);
+const LONG_CAPTURE_DELAY: Duration = Duration::from_millis(50);
+const LONG_NATIVE_CAPTURE_DELAY: Duration = Duration::from_millis(28);
 const LONG_TRAILING_CAPTURE_DELAY: Duration = Duration::from_millis(200);
-const LONG_MIN_CAPTURE_INTERVAL: Duration = Duration::from_millis(60);
+const LONG_MIN_CAPTURE_INTERVAL: Duration = Duration::from_millis(35);
 const LONG_AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(180);
 const LONG_AUTO_CAPTURE_DELAY: Duration = Duration::from_millis(120);
 const LONG_AUTO_CAPTURE_INTERVAL: Duration = Duration::from_millis(180);
@@ -696,13 +696,13 @@ impl Application {
                 self.invalidate();
             }
             AppState::Annotating => {
-                for button in &mut self.tool_buttons {
-                    button.hovered = point_in_button(p.x, p.y, button);
-                }
+                let hover_changed = self.update_toolbar_hover(p);
                 if self.is_drawing_annotation {
                     self.update_annotation(p);
+                    self.invalidate();
+                } else if hover_changed {
+                    self.invalidate();
                 }
-                self.invalidate();
             }
             _ => {}
         }
@@ -744,7 +744,6 @@ impl Application {
             if wheel_delta < 0 {
                 self.forward_long_scroll(wheel_delta, Point { x, y });
             }
-            self.invalidate();
         }
     }
 
@@ -958,6 +957,18 @@ impl Application {
         }
     }
 
+    fn update_toolbar_hover(&mut self, point: PointF) -> bool {
+        let mut changed = false;
+        for button in &mut self.tool_buttons {
+            let hovered = point_in_button(point.x, point.y, button);
+            if button.hovered != hovered {
+                button.hovered = hovered;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn on_toolbar_click(&mut self, button_type: ToolButtonType) {
         match button_type {
             ToolButtonType::Edit | ToolButtonType::Rectangle => {
@@ -1090,7 +1101,7 @@ impl Application {
 
         let mut options = LongScreenshotStitchOptions::default();
         options.min_append_rows = (selected.h / 20).max(24);
-        options.min_overlap_rows = (selected.h - 1).min((selected.h * 3 / 5).max(120));
+        options.min_overlap_rows = (selected.h - 1).min((selected.h * 2 / 5).max(80));
         options.max_overlap_rows = 900.min((selected.h - options.min_append_rows).max(1));
         options.reliable_match_score = 24.0;
         options.acceptable_match_score = 15.5;
