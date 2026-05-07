@@ -6,39 +6,39 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{
-    HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT as WinRect, TRUE, WPARAM,
+use windows::Win32::Foundation::{
+    HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT as WinRect, WPARAM,
 };
-use windows_sys::Win32::Graphics::Gdi::{
+use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CAPTUREBLT, CombineRgn,
     CreateCompatibleDC, CreateDIBSection, CreateRectRgn, DIB_RGB_COLORS, DeleteDC, DeleteObject,
     EndPaint, GetDC, HBITMAP, HDC, HGDIOBJ, HRGN, InvalidateRect, PAINTSTRUCT, PtInRect, RGN_OR,
     ReleaseDC, SRCCOPY, ScreenToClient, SelectObject, SetDIBitsToDevice, SetWindowRgn,
 };
-use windows_sys::Win32::Storage::Xps::PrintWindow;
-use windows_sys::Win32::System::DataExchange::{
+use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows_sys::Win32::UI::Controls::Dialogs::{
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows_sys::Win32::UI::HiDpi::{
+use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetKeyState, IsWindowEnabled, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
     RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, UnregisterHotKey, VK_ESCAPE,
 };
-use windows_sys::Win32::UI::Shell::{
+use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
+use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE,
     CWP_SKIPTRANSPARENT, CallNextHookEx, ChildWindowFromPointEx, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GA_ROOT, GW_HWNDNEXT,
@@ -54,6 +54,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_TIMER, WM_USER, WNDCLASSEXW, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
 };
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::core::{
     Annotation, AnnotationModel, AnnotationTool, AppEvent, AppState, ArrowAnnotation,
@@ -96,6 +97,34 @@ const LONG_AUTO_SCROLL_DELTA: f32 = -0.5;
 const LONG_MAX_OUTPUT_HEIGHT: i32 = 16_000;
 
 static HOOK_HWND: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+trait NullHandle {
+    fn is_null(self) -> bool;
+}
+
+macro_rules! impl_null_handle {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl NullHandle for $ty {
+                fn is_null(self) -> bool {
+                    self.0.is_null()
+                }
+            }
+        )*
+    };
+}
+
+impl_null_handle!(
+    HANDLE, HGLOBAL, HWND, HBITMAP, HDC, HGDIOBJ, HRGN, HHOOK, HMENU
+);
+
+fn pcwstr(value: &[u16]) -> PCWSTR {
+    PCWSTR::from_raw(value.as_ptr())
+}
+
+fn pwstr(value: &mut [u16]) -> PWSTR {
+    PWSTR::from_raw(value.as_mut_ptr())
+}
 
 const TOOLBAR_BG: Color = Color::rgba(18, 24, 31, 236);
 const TOOLBAR_STROKE: Color = Color::rgba(255, 255, 255, 34);
@@ -143,7 +172,7 @@ struct ToolButton {
 pub fn run() -> i32 {
     install_panic_logger();
     unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
     let mut app = match Application::create() {
@@ -211,7 +240,9 @@ struct Application {
 impl Application {
     fn create() -> Result<Box<Self>, String> {
         unsafe {
-            let hinstance = GetModuleHandleW(null());
+            let hinstance: HINSTANCE = GetModuleHandleW(PCWSTR::null())
+                .map_err(|error| format!("failed to get module handle: {error}"))?
+                .into();
             let class_name = to_wide(CLASS_NAME);
             let wc = WNDCLASSEXW {
                 cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -220,12 +251,12 @@ impl Application {
                 cbClsExtra: 0,
                 cbWndExtra: 0,
                 hInstance: hinstance,
-                hIcon: LoadIconW(null_mut(), IDI_APPLICATION),
-                hCursor: LoadCursorW(null_mut(), IDC_CROSS),
-                hbrBackground: null_mut(),
-                lpszMenuName: null(),
-                lpszClassName: class_name.as_ptr(),
-                hIconSm: LoadIconW(null_mut(), IDI_APPLICATION),
+                hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+                hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
+                hbrBackground: Default::default(),
+                lpszMenuName: PCWSTR::null(),
+                lpszClassName: pcwstr(&class_name),
+                hIconSm: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
             };
             RegisterClassExW(&wc);
 
@@ -237,7 +268,7 @@ impl Application {
             let now = Instant::now();
 
             let mut app = Box::new(Self {
-                hwnd: null_mut(),
+                hwnd: HWND::default(),
                 bounds,
                 screen_size,
                 state_machine: ScreenshotStateMachine::default(),
@@ -264,8 +295,8 @@ impl Application {
                 long_last_frame_capture: now,
                 long_source_region: Rect::default(),
                 long_stitcher: LongScreenshotStitcher::default(),
-                last_scroll_target: null_mut(),
-                mouse_hook: null_mut(),
+                last_scroll_target: HWND::default(),
+                mouse_hook: HHOOK::default(),
                 passthrough_region: None,
                 overlay_regions: Vec::new(),
                 is_dragging: false,
@@ -283,7 +314,7 @@ impl Application {
                 toolbar_y: 0.0,
                 toolbar_w: 0.0,
                 toolbar_h: 0.0,
-                tray_menu: null_mut(),
+                tray_menu: HMENU::default(),
                 tray_data: zeroed(),
             });
 
@@ -291,26 +322,24 @@ impl Application {
             let title = to_wide("Screenshot");
             let hwnd = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-                class_name.as_ptr(),
-                title.as_ptr(),
+                pcwstr(&class_name),
+                pcwstr(&title),
                 WS_POPUP,
                 bounds.x,
                 bounds.y,
                 bounds.w,
                 bounds.h,
-                null_mut(),
-                null_mut(),
-                hinstance,
-                app_ptr.cast(),
-            );
-            if hwnd.is_null() {
-                return Err("failed to create overlay window".to_string());
-            }
+                None,
+                None,
+                Some(hinstance),
+                Some(app_ptr.cast::<c_void>() as *const c_void),
+            )
+            .map_err(|error| format!("failed to create overlay window: {error}"))?;
             app.hwnd = hwnd;
-            HOOK_HWND.store(hwnd.cast(), Ordering::SeqCst);
+            HOOK_HWND.store(hwnd.0, Ordering::SeqCst);
             app.register_hotkeys();
             app.create_tray();
-            SetTimer(hwnd, TIMER_ID, 30, None);
+            SetTimer(Some(hwnd), TIMER_ID, 30, None);
             Ok(app)
         }
     }
@@ -318,8 +347,8 @@ impl Application {
     fn message_loop(&mut self) -> i32 {
         unsafe {
             let mut msg: MSG = zeroed();
-            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-                TranslateMessage(&msg);
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
@@ -329,24 +358,28 @@ impl Application {
     unsafe fn register_hotkeys(&self) {
         let ctrl_alt = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
         let ctrl_shift = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
-        RegisterHotKey(self.hwnd, HOTKEY_CTRL_ALT_X, ctrl_alt, 'X' as u32);
-        RegisterHotKey(self.hwnd, HOTKEY_F8, MOD_NOREPEAT, 0x77);
-        RegisterHotKey(self.hwnd, HOTKEY_CTRL_SHIFT_A, ctrl_shift, 'A' as u32);
+        let _ = RegisterHotKey(Some(self.hwnd), HOTKEY_CTRL_ALT_X, ctrl_alt, 'X' as u32);
+        let _ = RegisterHotKey(Some(self.hwnd), HOTKEY_F8, MOD_NOREPEAT, 0x77);
+        let _ = RegisterHotKey(Some(self.hwnd), HOTKEY_CTRL_SHIFT_A, ctrl_shift, 'A' as u32);
     }
 
     unsafe fn unregister_hotkeys(&self) {
-        UnregisterHotKey(self.hwnd, HOTKEY_CTRL_ALT_X);
-        UnregisterHotKey(self.hwnd, HOTKEY_F8);
-        UnregisterHotKey(self.hwnd, HOTKEY_CTRL_SHIFT_A);
+        let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_CTRL_ALT_X);
+        let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_F8);
+        let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_CTRL_SHIFT_A);
     }
 
     unsafe fn create_tray(&mut self) {
-        self.tray_menu = CreatePopupMenu();
+        let Ok(tray_menu) = CreatePopupMenu() else {
+            append_log("failed to create tray menu");
+            return;
+        };
+        self.tray_menu = tray_menu;
         let capture = to_wide("Take Screenshot");
-        AppendMenuW(self.tray_menu, MF_STRING, TRAY_CAPTURE_ID, capture.as_ptr());
-        AppendMenuW(self.tray_menu, MF_SEPARATOR, 0, null());
+        let _ = AppendMenuW(self.tray_menu, MF_STRING, TRAY_CAPTURE_ID, pcwstr(&capture));
+        let _ = AppendMenuW(self.tray_menu, MF_SEPARATOR, 0, PCWSTR::null());
         let quit = to_wide("Quit");
-        AppendMenuW(self.tray_menu, MF_STRING, TRAY_QUIT_ID, quit.as_ptr());
+        let _ = AppendMenuW(self.tray_menu, MF_STRING, TRAY_QUIT_ID, pcwstr(&quit));
 
         let mut nid: NOTIFYICONDATAW = zeroed();
         nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
@@ -354,38 +387,38 @@ impl Application {
         nid.uID = TRAY_ID;
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+        nid.hIcon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
         let tip = to_wide("Screenshot Tool");
         copy_wide_into(&mut nid.szTip, &tip);
-        Shell_NotifyIconW(NIM_ADD, &nid);
+        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         self.tray_data = nid;
     }
 
     unsafe fn destroy_tray(&mut self) {
         if !self.tray_data.hWnd.is_null() {
-            Shell_NotifyIconW(NIM_DELETE, &self.tray_data);
-            self.tray_data.hWnd = null_mut();
+            let _ = Shell_NotifyIconW(NIM_DELETE, &self.tray_data);
+            self.tray_data.hWnd = HWND::default();
         }
         if !self.tray_menu.is_null() {
-            DestroyMenu(self.tray_menu);
-            self.tray_menu = null_mut();
+            let _ = DestroyMenu(self.tray_menu);
+            self.tray_menu = HMENU::default();
         }
     }
 
     unsafe fn show_tray_menu(&self) {
         let mut point: POINT = zeroed();
-        GetCursorPos(&mut point);
-        SetForegroundWindow(self.hwnd);
-        TrackPopupMenu(
+        let _ = GetCursorPos(&mut point);
+        let _ = SetForegroundWindow(self.hwnd);
+        let _ = TrackPopupMenu(
             self.tray_menu,
             TPM_RIGHTBUTTON,
             point.x,
             point.y,
-            0,
+            None,
             self.hwnd,
-            null(),
+            None,
         );
-        PostMessageW(self.hwnd, 0, 0, 0);
+        let _ = PostMessageW(Some(self.hwnd), 0, WPARAM(0), LPARAM(0));
     }
 
     fn on_hotkey_triggered(&mut self) {
@@ -422,25 +455,25 @@ impl Application {
 
     fn show_overlay(&self) {
         unsafe {
-            SetWindowPos(
+            let _ = SetWindowPos(
                 self.hwnd,
-                null_mut(),
+                None,
                 self.bounds.x,
                 self.bounds.y,
                 self.bounds.w,
                 self.bounds.h,
                 SWP_SHOWWINDOW | SWP_NOACTIVATE,
             );
-            ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-            SetForegroundWindow(self.hwnd);
-            SetFocus(self.hwnd);
-            InvalidateRect(self.hwnd, null(), TRUE);
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetForegroundWindow(self.hwnd);
+            let _ = SetFocus(Some(self.hwnd));
+            let _ = InvalidateRect(Some(self.hwnd), None, true);
         }
     }
 
     fn hide_overlay(&self) {
         unsafe {
-            ShowWindow(self.hwnd, SW_HIDE);
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
     }
 
@@ -455,7 +488,7 @@ impl Application {
         unsafe {
             let Some(hole) = self.passthrough_region else {
                 self.overlay_regions.clear();
-                SetWindowRgn(self.hwnd, null_mut(), TRUE);
+                SetWindowRgn(self.hwnd, None, true);
                 self.invalidate();
                 return;
             };
@@ -503,8 +536,8 @@ impl Application {
                 add_rect_to_region(region, self.screen_size, rect.x, rect.y, rect.w, rect.h);
             }
 
-            if SetWindowRgn(self.hwnd, region, TRUE) == 0 {
-                DeleteObject(region as HGDIOBJ);
+            if SetWindowRgn(self.hwnd, Some(region), true) == 0 {
+                let _ = DeleteObject(HGDIOBJ::from(region));
             }
             self.invalidate();
         }
@@ -513,15 +546,16 @@ impl Application {
     fn update_mouse_hook(&mut self) {
         unsafe {
             if self.passthrough_region.is_some() && self.mouse_hook.is_null() {
-                let hinstance = GetModuleHandleW(null()) as HINSTANCE;
-                self.mouse_hook =
-                    SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), hinstance, 0);
-                if self.mouse_hook.is_null() {
-                    append_log("failed to install low-level mouse hook");
+                let hinstance = GetModuleHandleW(PCWSTR::null()).ok().map(HINSTANCE::from);
+                match SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), hinstance, 0) {
+                    Ok(hook) => self.mouse_hook = hook,
+                    Err(error) => {
+                        append_log(&format!("failed to install low-level mouse hook: {error}"))
+                    }
                 }
             } else if self.passthrough_region.is_none() && !self.mouse_hook.is_null() {
-                UnhookWindowsHookEx(self.mouse_hook);
-                self.mouse_hook = null_mut();
+                let _ = UnhookWindowsHookEx(self.mouse_hook);
+                self.mouse_hook = HHOOK::default();
             }
         }
     }
@@ -543,7 +577,7 @@ impl Application {
         }
         unsafe {
             let mut cursor: POINT = zeroed();
-            if GetCursorPos(&mut cursor) == 0 {
+            if GetCursorPos(&mut cursor).is_err() {
                 return false;
             }
             let cx = (cursor.x - self.bounds.x) as f32;
@@ -569,7 +603,9 @@ impl Application {
                 target = find_window_from_point_excluding(point, self.hwnd);
             }
             if target.is_null() {
-                if !self.last_scroll_target.is_null() && IsWindow(self.last_scroll_target) != 0 {
+                if !self.last_scroll_target.is_null()
+                    && IsWindow(Some(self.last_scroll_target)).0 != 0
+                {
                     target = self.last_scroll_target;
                 } else {
                     append_log(&format!(
@@ -583,16 +619,17 @@ impl Application {
             self.last_scroll_target = target;
             let root = GetAncestor(target, GA_ROOT);
             if !root.is_null() {
-                SetForegroundWindow(root);
+                let _ = SetForegroundWindow(root);
             }
 
-            let wparam = ((wheel_delta as i16 as u16 as usize) << 16) as WPARAM;
+            let wparam = WPARAM((wheel_delta as i16 as u16 as usize) << 16);
             let posted = PostMessageW(
-                target,
+                Some(target),
                 WM_MOUSEWHEEL,
                 wparam,
                 make_lparam(screen_point.x, screen_point.y),
-            ) != 0;
+            )
+            .is_ok();
             append_log(&format!(
                 "scrollAt post result={} point={},{} delta={} target={:?} root={:?}",
                 posted, screen_point.x, screen_point.y, wheel_delta, target, root
@@ -603,7 +640,7 @@ impl Application {
 
     fn invalidate(&self) {
         unsafe {
-            InvalidateRect(self.hwnd, null(), TRUE);
+            let _ = InvalidateRect(Some(self.hwnd), None, true);
         }
     }
 
@@ -683,7 +720,7 @@ impl Application {
         if state == AppState::Selecting && self.is_dragging {
             unsafe {
                 if GetCapture() == self.hwnd {
-                    ReleaseCapture();
+                    let _ = ReleaseCapture();
                 }
             }
             self.is_dragging = false;
@@ -712,7 +749,7 @@ impl Application {
     }
 
     fn on_key_down(&mut self, key: u32) {
-        if key == VK_ESCAPE as u32 {
+        if key == VK_ESCAPE.0 as u32 {
             self.cancel_session();
             return;
         }
@@ -809,7 +846,7 @@ impl Application {
         self.long_last_frame_capture = self.next_long_auto_scroll;
         self.long_source_region = Rect::default();
         self.long_stitcher = LongScreenshotStitcher::default();
-        self.last_scroll_target = null_mut();
+        self.last_scroll_target = HWND::default();
         self.long_background = None;
         self.set_passthrough_region(None, Vec::new());
     }
@@ -1086,7 +1123,7 @@ impl Application {
         self.long_last_frame_capture = now;
         self.next_long_auto_scroll = now;
         self.next_long_auto_preview_render = now;
-        self.last_scroll_target = null_mut();
+        self.last_scroll_target = HWND::default();
         self.annotations.clear();
         self.command_history.clear();
         self.state_machine.set_selected_region(
@@ -1532,7 +1569,7 @@ impl Application {
             if !hdc.is_null() {
                 present_image(hdc, &mut buffer);
             }
-            EndPaint(self.hwnd, &ps);
+            let _ = EndPaint(self.hwnd, &ps);
         }
     }
 
@@ -1765,15 +1802,15 @@ impl Drop for Application {
         unsafe {
             HOOK_HWND.store(null_mut(), Ordering::SeqCst);
             if !self.mouse_hook.is_null() {
-                UnhookWindowsHookEx(self.mouse_hook);
-                self.mouse_hook = null_mut();
+                let _ = UnhookWindowsHookEx(self.mouse_hook);
+                self.mouse_hook = HHOOK::default();
             }
             self.unregister_hotkeys();
-            KillTimer(self.hwnd, TIMER_ID);
+            let _ = KillTimer(Some(self.hwnd), TIMER_ID);
             self.destroy_tray();
             if !self.hwnd.is_null() {
-                DestroyWindow(self.hwnd);
-                self.hwnd = null_mut();
+                let _ = DestroyWindow(self.hwnd);
+                self.hwnd = HWND::default();
             }
         }
     }
@@ -1791,7 +1828,7 @@ unsafe extern "system" fn wnd_proc(
         Ok(result) => result,
         Err(_) => {
             append_log(&format!("panic escaped window proc: msg=0x{msg:X}"));
-            0
+            LRESULT(0)
         }
     }
 }
@@ -1801,25 +1838,25 @@ unsafe extern "system" fn low_level_mouse_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if code >= 0 && wparam as u32 == WM_MOUSEWHEEL {
-        let hwnd = HOOK_HWND.load(Ordering::SeqCst) as HWND;
+    if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
+        let hwnd = HWND(HOOK_HWND.load(Ordering::SeqCst));
         if !hwnd.is_null() {
-            let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
+            let mouse = &*(lparam.0 as *const MSLLHOOKSTRUCT);
             let wheel_delta = ((mouse.mouseData >> 16) & 0xffff) as i16 as i32;
-            PostMessageW(
-                hwnd,
+            let _ = PostMessageW(
+                Some(hwnd),
                 WM_LONG_WHEEL,
-                wheel_delta as WPARAM,
+                WPARAM(wheel_delta as usize),
                 make_lparam(mouse.pt.x, mouse.pt.y),
             );
         }
     }
-    CallNextHookEx(null_mut(), code, wparam, lparam)
+    CallNextHookEx(None, code, wparam, lparam)
 }
 
 unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
-        let createstruct = lparam as *const CREATESTRUCTW;
+        let createstruct = lparam.0 as *const CREATESTRUCTW;
         let app = (*createstruct).lpCreateParams as *mut Application;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).hwnd = hwnd;
@@ -1832,24 +1869,23 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
 
     let app = &mut *app;
     match msg {
-        WM_CREATE => 0,
+        WM_CREATE => LRESULT(0),
         WM_HOTKEY => {
             app.on_hotkey_triggered();
-            0
+            LRESULT(0)
         }
         WM_TRAYICON => {
-            if loword(lparam as usize) == windows_sys::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP
-            {
+            if loword(lparam.0 as usize) == windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP {
                 app.show_tray_menu();
-            } else if loword(lparam as usize)
-                == windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK
+            } else if loword(lparam.0 as usize)
+                == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK
             {
                 app.on_hotkey_triggered();
             }
-            0
+            LRESULT(0)
         }
         WM_COMMAND => {
-            match loword(wparam) as usize {
+            match loword(wparam.0) as usize {
                 TRAY_CAPTURE_ID => app.on_hotkey_triggered(),
                 TRAY_QUIT_ID => {
                     app.hide_overlay();
@@ -1857,58 +1893,58 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 }
                 _ => {}
             }
-            0
+            LRESULT(0)
         }
         WM_TIMER => {
             app.on_timer();
-            0
+            LRESULT(0)
         }
         WM_PAINT => {
             app.paint();
-            0
+            LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             app.on_mouse_down(true, get_x_lparam(lparam), get_y_lparam(lparam));
-            0
+            LRESULT(0)
         }
         WM_RBUTTONDOWN => {
             app.on_mouse_down(false, get_x_lparam(lparam), get_y_lparam(lparam));
-            0
+            LRESULT(0)
         }
         WM_MOUSEMOVE => {
             app.on_mouse_move(get_x_lparam(lparam), get_y_lparam(lparam));
-            0
+            LRESULT(0)
         }
         WM_LBUTTONUP => {
             app.on_mouse_up(true, get_x_lparam(lparam), get_y_lparam(lparam));
-            0
+            LRESULT(0)
         }
         WM_MOUSEWHEEL => {
             let mut point = POINT {
                 x: get_x_lparam(lparam),
                 y: get_y_lparam(lparam),
             };
-            ScreenToClient(hwnd, &mut point);
+            let _ = ScreenToClient(hwnd, &mut point);
             app.on_mouse_wheel(get_wheel_delta(wparam), point.x, point.y);
-            0
+            LRESULT(0)
         }
         WM_LONG_WHEEL => {
             app.handle_native_long_scroll(
-                wparam as i16 as i32,
+                wparam.0 as i16 as i32,
                 Point {
                     x: get_x_lparam(lparam),
                     y: get_y_lparam(lparam),
                 },
             );
-            0
+            LRESULT(0)
         }
         WM_KEYDOWN => {
-            app.on_key_down(wparam as u32);
-            0
+            app.on_key_down(wparam.0 as u32);
+            LRESULT(0)
         }
         WM_DESTROY => {
             PostQuitMessage(0);
-            0
+            LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -2340,12 +2376,12 @@ fn capture_covered_window(desktop_bounds: Rect, overlay_hwnd: HWND, region: Rect
         }
 
         let root = GetAncestor(target, GA_ROOT);
-        if root.is_null() || IsWindowVisible(root) == 0 || IsIconic(root) != 0 {
+        if root.is_null() || IsWindowVisible(root).0 == 0 || IsIconic(root).0 != 0 {
             return None;
         }
 
         let mut window_rect: WinRect = zeroed();
-        if GetWindowRect(root, &mut window_rect) == 0 {
+        if GetWindowRect(root, &mut window_rect).is_err() {
             return None;
         }
         let window_w = window_rect.right - window_rect.left;
@@ -2368,13 +2404,13 @@ fn capture_covered_window(desktop_bounds: Rect, overlay_hwnd: HWND, region: Rect
             return None;
         }
 
-        let screen_dc = GetDC(null_mut());
+        let screen_dc = GetDC(None);
         if screen_dc.is_null() {
             return None;
         }
-        let mem_dc = CreateCompatibleDC(screen_dc);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
         if mem_dc.is_null() {
-            ReleaseDC(null_mut(), screen_dc);
+            ReleaseDC(None, screen_dc);
             return None;
         }
 
@@ -2385,7 +2421,7 @@ fn capture_covered_window(desktop_bounds: Rect, overlay_hwnd: HWND, region: Rect
             biHeight: -window_h,
             biPlanes: 1,
             biBitCount: 32,
-            biCompression: BI_RGB,
+            biCompression: BI_RGB.0,
             biSizeImage: (window_w * window_h * 4) as u32,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,
@@ -2394,20 +2430,21 @@ fn capture_covered_window(desktop_bounds: Rect, overlay_hwnd: HWND, region: Rect
         };
         let mut bits: *mut c_void = null_mut();
         let bitmap: HBITMAP =
-            CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            CreateDIBSection(Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .unwrap_or_default();
         if bitmap.is_null() || bits.is_null() {
             if !bitmap.is_null() {
-                DeleteObject(bitmap as HGDIOBJ);
+                let _ = DeleteObject(HGDIOBJ::from(bitmap));
             }
-            DeleteDC(mem_dc);
-            ReleaseDC(null_mut(), screen_dc);
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(None, screen_dc);
             return None;
         }
 
-        let old = SelectObject(mem_dc, bitmap as HGDIOBJ);
-        let printed = PrintWindow(root, mem_dc, PW_RENDERFULLCONTENT);
+        let old = SelectObject(mem_dc, HGDIOBJ::from(bitmap));
+        let printed = PrintWindow(root, mem_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT));
         let mut image = None;
-        if printed != 0 {
+        if printed.0 != 0 {
             let mut rgba = vec![0; region.w as usize * region.h as usize * 4];
             let bgra = std::slice::from_raw_parts(
                 bits as *const u8,
@@ -2435,25 +2472,25 @@ fn capture_covered_window(desktop_bounds: Rect, overlay_hwnd: HWND, region: Rect
         }
 
         SelectObject(mem_dc, old);
-        DeleteObject(bitmap as HGDIOBJ);
-        DeleteDC(mem_dc);
-        ReleaseDC(null_mut(), screen_dc);
+        let _ = DeleteObject(HGDIOBJ::from(bitmap));
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(None, screen_dc);
         image
     }
 }
 
 unsafe fn find_window_from_point_excluding(point: POINT, ignored: HWND) -> HWND {
-    let mut hwnd = GetTopWindow(null_mut());
+    let mut hwnd = GetTopWindow(None).unwrap_or_default();
     while !hwnd.is_null() {
         if hwnd != ignored
             && GetAncestor(hwnd, GA_ROOT) != ignored
-            && IsWindowVisible(hwnd) != 0
-            && IsWindowEnabled(hwnd) != 0
+            && IsWindowVisible(hwnd).0 != 0
+            && IsWindowEnabled(hwnd).0 != 0
         {
             let mut rect: WinRect = zeroed();
-            if GetWindowRect(hwnd, &mut rect) != 0 && PtInRect(&rect, point) != 0 {
+            if GetWindowRect(hwnd, &mut rect).is_ok() && PtInRect(&rect, point).0 != 0 {
                 let mut client = point;
-                ScreenToClient(hwnd, &mut client);
+                let _ = ScreenToClient(hwnd, &mut client);
                 let child = ChildWindowFromPointEx(
                     hwnd,
                     client,
@@ -2462,9 +2499,9 @@ unsafe fn find_window_from_point_excluding(point: POINT, ignored: HWND) -> HWND 
                 return if child.is_null() { hwnd } else { child };
             }
         }
-        hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+        hwnd = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
     }
-    null_mut()
+    HWND::default()
 }
 
 fn capture_region(desktop_bounds: Rect, region: Rect) -> Option<Image> {
@@ -2472,13 +2509,13 @@ fn capture_region(desktop_bounds: Rect, region: Rect) -> Option<Image> {
         return None;
     }
     unsafe {
-        let screen_dc = GetDC(null_mut());
+        let screen_dc = GetDC(None);
         if screen_dc.is_null() {
             return None;
         }
-        let mem_dc = CreateCompatibleDC(screen_dc);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
         if mem_dc.is_null() {
-            ReleaseDC(null_mut(), screen_dc);
+            ReleaseDC(None, screen_dc);
             return None;
         }
         let mut bmi: BITMAPINFO = zeroed();
@@ -2488,7 +2525,7 @@ fn capture_region(desktop_bounds: Rect, region: Rect) -> Option<Image> {
             biHeight: -region.h,
             biPlanes: 1,
             biBitCount: 32,
-            biCompression: BI_RGB,
+            biCompression: BI_RGB.0,
             biSizeImage: (region.w * region.h * 4) as u32,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,
@@ -2497,26 +2534,28 @@ fn capture_region(desktop_bounds: Rect, region: Rect) -> Option<Image> {
         };
         let mut bits: *mut c_void = null_mut();
         let bitmap: HBITMAP =
-            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .unwrap_or_default();
         if bitmap.is_null() || bits.is_null() {
-            DeleteDC(mem_dc);
-            ReleaseDC(null_mut(), screen_dc);
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(None, screen_dc);
             return None;
         }
-        let old = SelectObject(mem_dc, bitmap as HGDIOBJ);
+        let old = SelectObject(mem_dc, HGDIOBJ::from(bitmap));
         let ok = BitBlt(
             mem_dc,
             0,
             0,
             region.w,
             region.h,
-            screen_dc,
+            Some(screen_dc),
             desktop_bounds.x + region.x,
             desktop_bounds.y + region.y,
             SRCCOPY | CAPTUREBLT,
-        );
+        )
+        .is_ok();
         let mut rgba = vec![0; region.w as usize * region.h as usize * 4];
-        if ok != 0 {
+        if ok {
             let bgra = std::slice::from_raw_parts(bits as *const u8, rgba.len());
             for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
                 dst[0] = src[2];
@@ -2526,10 +2565,10 @@ fn capture_region(desktop_bounds: Rect, region: Rect) -> Option<Image> {
             }
         }
         SelectObject(mem_dc, old);
-        DeleteObject(bitmap as HGDIOBJ);
-        DeleteDC(mem_dc);
-        ReleaseDC(null_mut(), screen_dc);
-        (ok != 0).then_some(Image {
+        let _ = DeleteObject(HGDIOBJ::from(bitmap));
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(None, screen_dc);
+        ok.then_some(Image {
             width: region.w,
             height: region.h,
             pixels: rgba,
@@ -2552,7 +2591,7 @@ unsafe fn present_image(hdc: HDC, image: &mut Image) {
         biHeight: -image.height,
         biPlanes: 1,
         biBitCount: 32,
-        biCompression: BI_RGB,
+        biCompression: BI_RGB.0,
         biSizeImage: (image.width * image.height * 4) as u32,
         biXPelsPerMeter: 0,
         biYPelsPerMeter: 0,
@@ -2576,20 +2615,19 @@ unsafe fn present_image(hdc: HDC, image: &mut Image) {
 }
 
 unsafe fn write_clipboard_image(hwnd: HWND, rgba: &[u8], width: i32, height: i32) -> bool {
-    if OpenClipboard(hwnd) == 0 {
+    if OpenClipboard(Some(hwnd)).is_err() {
         return false;
     }
-    EmptyClipboard();
+    let _ = EmptyClipboard();
     let header_size = size_of::<BITMAPINFOHEADER>();
     let pixel_size = width as usize * height as usize * 4;
-    let hmem = GlobalAlloc(GMEM_MOVEABLE, header_size + pixel_size);
-    if hmem.is_null() {
-        CloseClipboard();
+    let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, header_size + pixel_size) else {
+        let _ = CloseClipboard();
         return false;
-    }
+    };
     let ptr = GlobalLock(hmem) as *mut u8;
     if ptr.is_null() {
-        CloseClipboard();
+        let _ = CloseClipboard();
         return false;
     }
     let bih = ptr as *mut BITMAPINFOHEADER;
@@ -2599,7 +2637,7 @@ unsafe fn write_clipboard_image(hwnd: HWND, rgba: &[u8], width: i32, height: i32
         biHeight: height,
         biPlanes: 1,
         biBitCount: 32,
-        biCompression: BI_RGB,
+        biCompression: BI_RGB.0,
         biSizeImage: pixel_size as u32,
         biXPelsPerMeter: 0,
         biYPelsPerMeter: 0,
@@ -2619,26 +2657,25 @@ unsafe fn write_clipboard_image(hwnd: HWND, rgba: &[u8], width: i32, height: i32
             dst_pixels[dst + 3] = rgba[src + 3];
         }
     }
-    GlobalUnlock(hmem);
-    SetClipboardData(CF_DIB_FORMAT, hmem as HANDLE);
+    let _ = GlobalUnlock(hmem);
+    let _ = SetClipboardData(CF_DIB_FORMAT, Some(HANDLE(hmem.0)));
 
     if let Some(png) = encode_rgba_png(width, height, rgba) {
         let format_name = to_wide("PNG");
-        let png_format = RegisterClipboardFormatW(format_name.as_ptr());
+        let png_format = RegisterClipboardFormatW(pcwstr(&format_name));
         if png_format != 0 {
-            let png_mem = GlobalAlloc(GMEM_MOVEABLE, png.len());
-            if !png_mem.is_null() {
+            if let Ok(png_mem) = GlobalAlloc(GMEM_MOVEABLE, png.len()) {
                 let png_ptr = GlobalLock(png_mem) as *mut u8;
                 if !png_ptr.is_null() {
                     std::ptr::copy_nonoverlapping(png.as_ptr(), png_ptr, png.len());
-                    GlobalUnlock(png_mem);
-                    SetClipboardData(png_format, png_mem as HANDLE);
+                    let _ = GlobalUnlock(png_mem);
+                    let _ = SetClipboardData(png_format, Some(HANDLE(png_mem.0)));
                 }
             }
         }
     }
 
-    CloseClipboard();
+    let _ = CloseClipboard();
     true
 }
 
@@ -2663,12 +2700,12 @@ unsafe fn show_save_dialog(hwnd: HWND) -> Option<PathBuf> {
     let def_ext = to_wide("png");
     ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
     ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = filter.as_ptr();
-    ofn.lpstrFile = filename.as_mut_ptr();
+    ofn.lpstrFilter = pcwstr(&filter);
+    ofn.lpstrFile = pwstr(&mut filename);
     ofn.nMaxFile = filename.len() as u32;
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    ofn.lpstrDefExt = def_ext.as_ptr();
-    if GetSaveFileNameW(&mut ofn) == 0 {
+    ofn.lpstrDefExt = pcwstr(&def_ext);
+    if GetSaveFileNameW(&mut ofn).0 == 0 {
         return None;
     }
     let len = filename
@@ -2799,8 +2836,8 @@ unsafe fn add_rect_to_region(region: HRGN, size: Size, x: i32, y: i32, w: i32, h
     if rect_region.is_null() {
         return;
     }
-    CombineRgn(region, region, rect_region, RGN_OR);
-    DeleteObject(rect_region as HGDIOBJ);
+    CombineRgn(Some(region), Some(region), Some(rect_region), RGN_OR);
+    let _ = DeleteObject(HGDIOBJ::from(rect_region));
 }
 
 fn push_toolbar_button(
@@ -2833,7 +2870,7 @@ fn copy_wide_into(dst: &mut [u16], src: &[u16]) {
 }
 
 fn get_x_lparam(lparam: LPARAM) -> i32 {
-    (lparam as u32 & 0xffff) as i16 as i32
+    (lparam.0 as u32 & 0xffff) as i16 as i32
 }
 
 fn max_instant(a: Instant, b: Instant) -> Instant {
@@ -2841,11 +2878,11 @@ fn max_instant(a: Instant, b: Instant) -> Instant {
 }
 
 fn get_y_lparam(lparam: LPARAM) -> i32 {
-    ((lparam as u32 >> 16) & 0xffff) as i16 as i32
+    ((lparam.0 as u32 >> 16) & 0xffff) as i16 as i32
 }
 
 fn get_wheel_delta(wparam: WPARAM) -> i32 {
-    ((wparam >> 16) & 0xffff) as i16 as i32
+    ((wparam.0 >> 16) & 0xffff) as i16 as i32
 }
 
 fn loword(value: usize) -> u32 {
@@ -2853,5 +2890,5 @@ fn loword(value: usize) -> u32 {
 }
 
 fn make_lparam(x: i32, y: i32) -> LPARAM {
-    ((x as u16 as usize) | ((y as u16 as usize) << 16)) as LPARAM
+    LPARAM(((x as u16 as usize) | ((y as u16 as usize) << 16)) as isize)
 }
