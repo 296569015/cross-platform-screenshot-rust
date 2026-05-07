@@ -8,6 +8,8 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -89,12 +91,13 @@ const LONG_CAPTURE_DELAY: Duration = Duration::from_millis(50);
 const LONG_NATIVE_CAPTURE_DELAY: Duration = Duration::from_millis(28);
 const LONG_TRAILING_CAPTURE_DELAY: Duration = Duration::from_millis(200);
 const LONG_MIN_CAPTURE_INTERVAL: Duration = Duration::from_millis(35);
-const LONG_AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(180);
-const LONG_AUTO_CAPTURE_DELAY: Duration = Duration::from_millis(120);
-const LONG_AUTO_CAPTURE_INTERVAL: Duration = Duration::from_millis(180);
+const LONG_AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(120);
+const LONG_AUTO_CAPTURE_DELAY: Duration = Duration::from_millis(45);
+const LONG_AUTO_CAPTURE_INTERVAL: Duration = Duration::from_millis(55);
 const LONG_AUTO_PREVIEW_RENDER_INTERVAL: Duration = Duration::from_millis(360);
-const LONG_AUTO_SCROLL_DELTA: f32 = -0.5;
+const LONG_AUTO_SCROLL_DELTA: f32 = -0.33;
 const LONG_MAX_OUTPUT_HEIGHT: i32 = 16_000;
+const ENABLE_LONG_CAPTURE_LOGS: bool = cfg!(debug_assertions);
 
 static HOOK_HWND: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
@@ -169,6 +172,76 @@ struct ToolButton {
     hovered: bool,
 }
 
+struct LongCaptureWorker {
+    request_tx: Sender<LongCaptureRequest>,
+    response_rx: Receiver<LongCaptureResponse>,
+}
+
+#[derive(Clone, Copy)]
+struct LongCaptureRequest {
+    generation: u64,
+    seq: u64,
+    desktop_bounds: Rect,
+    overlay_hwnd: isize,
+    region: Rect,
+}
+
+struct LongCaptureResponse {
+    generation: u64,
+    seq: u64,
+    frame: Option<Image>,
+}
+
+impl LongCaptureWorker {
+    fn spawn() -> Option<Self> {
+        let (request_tx, request_rx) = mpsc::channel::<LongCaptureRequest>();
+        let (response_tx, response_rx) = mpsc::channel::<LongCaptureResponse>();
+        thread::Builder::new()
+            .name("long-capture-worker".to_string())
+            .spawn(move || {
+                while let Ok(request) = request_rx.recv() {
+                    let frame =
+                        capture_region(request.desktop_bounds, request.region).or_else(|| {
+                            let overlay_hwnd = HWND(request.overlay_hwnd as *mut c_void);
+                            capture_covered_window(
+                                request.desktop_bounds,
+                                overlay_hwnd,
+                                request.region,
+                            )
+                        });
+                    if response_tx
+                        .send(LongCaptureResponse {
+                            generation: request.generation,
+                            seq: request.seq,
+                            frame,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+
+        Some(Self {
+            request_tx,
+            response_rx,
+        })
+    }
+
+    fn request(&self, request: LongCaptureRequest) -> bool {
+        self.request_tx.send(request).is_ok()
+    }
+
+    fn drain_responses(&self) -> Vec<LongCaptureResponse> {
+        let mut responses = Vec::new();
+        while let Ok(response) = self.response_rx.try_recv() {
+            responses.push(response);
+        }
+        responses
+    }
+}
+
 pub fn run() -> i32 {
     install_panic_logger();
     unsafe {
@@ -214,6 +287,14 @@ struct Application {
     long_last_frame_capture: Instant,
     long_source_region: Rect,
     long_stitcher: LongScreenshotStitcher,
+    long_capture_worker: Option<LongCaptureWorker>,
+    long_capture_generation: u64,
+    long_capture_in_flight: bool,
+    long_capture_in_flight_seq: u64,
+    long_capture_in_flight_needs_trailing: bool,
+    long_capture_in_flight_trailing_due: Instant,
+    long_preview_thumbnail: Option<Image>,
+    long_preview_thumbnail_rect: Rect,
     last_scroll_target: HWND,
     mouse_hook: HHOOK,
     passthrough_region: Option<Rect>,
@@ -295,6 +376,14 @@ impl Application {
                 long_last_frame_capture: now,
                 long_source_region: Rect::default(),
                 long_stitcher: LongScreenshotStitcher::default(),
+                long_capture_worker: LongCaptureWorker::spawn(),
+                long_capture_generation: 0,
+                long_capture_in_flight: false,
+                long_capture_in_flight_seq: 0,
+                long_capture_in_flight_needs_trailing: false,
+                long_capture_in_flight_trailing_due: now,
+                long_preview_thumbnail: None,
+                long_preview_thumbnail_rect: Rect::default(),
                 last_scroll_target: HWND::default(),
                 mouse_hook: HHOOK::default(),
                 passthrough_region: None,
@@ -608,7 +697,7 @@ impl Application {
                 {
                     target = self.last_scroll_target;
                 } else {
-                    append_log(&format!(
+                    append_long_log(&format!(
                         "scrollAt failed stage=no-target point={},{} delta={}",
                         screen_point.x, screen_point.y, wheel_delta
                     ));
@@ -630,7 +719,7 @@ impl Application {
                 make_lparam(screen_point.x, screen_point.y),
             )
             .is_ok();
-            append_log(&format!(
+            append_long_log(&format!(
                 "scrollAt post result={} point={},{} delta={} target={:?} root={:?}",
                 posted, screen_point.x, screen_point.y, wheel_delta, target, root
             ));
@@ -773,6 +862,7 @@ impl Application {
     }
 
     fn on_timer(&mut self) {
+        self.poll_long_capture_worker();
         if self.long_auto_scroll_active && Instant::now() >= self.next_long_auto_scroll {
             let now = Instant::now();
             self.next_long_auto_scroll = now + LONG_AUTO_SCROLL_INTERVAL;
@@ -788,7 +878,7 @@ impl Application {
                     LONG_AUTO_CAPTURE_DELAY,
                     LONG_AUTO_CAPTURE_INTERVAL,
                 );
-                append_log(&format!(
+                append_long_log(&format!(
                     "auto-scroll step seq={} delta={} capture_due_ms={} next_scroll_ms={}",
                     seq,
                     wheel_delta,
@@ -797,7 +887,7 @@ impl Application {
                 ));
             } else {
                 self.long_auto_stalls += 1;
-                append_log(&format!(
+                append_long_log(&format!(
                     "auto-scroll stall count={} reason=scroll-forward-failed",
                     self.long_auto_stalls
                 ));
@@ -809,6 +899,7 @@ impl Application {
             }
         }
         self.run_pending_long_capture();
+        self.poll_long_capture_worker();
     }
 
     fn cancel_session(&mut self) {
@@ -845,6 +936,13 @@ impl Application {
         self.long_last_frame_capture = self.next_long_auto_scroll;
         self.long_source_region = Rect::default();
         self.long_stitcher = LongScreenshotStitcher::default();
+        self.long_capture_generation = self.long_capture_generation.saturating_add(1);
+        self.long_capture_in_flight = false;
+        self.long_capture_in_flight_seq = 0;
+        self.long_capture_in_flight_needs_trailing = false;
+        self.long_capture_in_flight_trailing_due = self.next_long_auto_scroll;
+        self.long_preview_thumbnail = None;
+        self.long_preview_thumbnail_rect = Rect::default();
         self.last_scroll_target = HWND::default();
         self.long_background = None;
         self.set_passthrough_region(None, Vec::new());
@@ -1118,6 +1216,7 @@ impl Application {
             self.long_stitcher.height(),
             self.long_stitcher.pixels().to_vec(),
         );
+        self.update_long_preview_thumbnail();
         self.is_long_capture_active = true;
         self.is_long_result = true;
         self.long_auto_scroll_active = false;
@@ -1134,6 +1233,13 @@ impl Application {
         self.long_last_frame_capture = now;
         self.next_long_auto_scroll = now;
         self.next_long_auto_preview_render = now;
+        self.long_capture_generation = self.long_capture_generation.saturating_add(1);
+        self.long_capture_in_flight = false;
+        self.long_capture_in_flight_seq = 0;
+        self.long_capture_in_flight_needs_trailing = false;
+        self.long_capture_in_flight_trailing_due = now;
+        self.long_preview_thumbnail = None;
+        self.long_preview_thumbnail_rect = Rect::default();
         self.last_scroll_target = HWND::default();
         self.annotations.clear();
         self.command_history.clear();
@@ -1145,7 +1251,7 @@ impl Application {
             Some(self.long_source_region),
             self.long_screenshot_overlay_regions(),
         );
-        append_log(&format!(
+        append_long_log(&format!(
             "long-session start source={},{} {}x{}",
             self.long_source_region.x,
             self.long_source_region.y,
@@ -1162,6 +1268,8 @@ impl Application {
             self.long_auto_stalls = 0;
             self.pending_long_frame_capture = false;
             self.long_needs_trailing_capture = false;
+            self.long_capture_generation = self.long_capture_generation.saturating_add(1);
+            self.long_capture_in_flight = false;
             self.set_passthrough_region(None, Vec::new());
             self.build_toolbar();
         }
@@ -1182,7 +1290,7 @@ impl Application {
         };
         let started = Instant::now();
         if !self.post_scroll_at(screen_point, wheel_delta) {
-            append_log(&format!(
+            append_long_log(&format!(
                 "scroll-forward failed delta={} point={},{}",
                 wheel_delta, screen_point.x, screen_point.y
             ));
@@ -1193,7 +1301,7 @@ impl Application {
             LONG_CAPTURE_DELAY,
             LONG_MIN_CAPTURE_INTERVAL,
         );
-        append_log(&format!(
+        append_long_log(&format!(
             "scroll-forward ok seq={} delta={} point={},{} capture_due_ms={} trailing_due_ms={}",
             seq,
             wheel_delta,
@@ -1220,7 +1328,7 @@ impl Application {
                 LONG_NATIVE_CAPTURE_DELAY,
                 LONG_MIN_CAPTURE_INTERVAL,
             );
-            append_log(&format!(
+            append_long_log(&format!(
                 "scroll-observed ok seq={} delta={} point={},{} capture_due_ms={} trailing_due_ms={}",
                 seq,
                 wheel_delta,
@@ -1257,7 +1365,7 @@ impl Application {
         self.long_trailing_capture_due = now + LONG_TRAILING_CAPTURE_DELAY;
         self.long_needs_trailing_capture = true;
         self.pending_long_frame_capture = true;
-        append_log(&format!(
+        append_long_log(&format!(
             "long-capture scheduled seq={} due_ms={} min_interval_ms={}",
             self.long_pending_scroll_seq,
             self.long_frame_capture_due
@@ -1269,7 +1377,10 @@ impl Application {
     }
 
     fn run_pending_long_capture(&mut self) {
-        if !self.pending_long_frame_capture || !self.is_long_capture_active {
+        if !self.pending_long_frame_capture
+            || !self.is_long_capture_active
+            || self.long_capture_in_flight
+        {
             return;
         }
         let now = Instant::now();
@@ -1290,14 +1401,92 @@ impl Application {
         self.long_needs_trailing_capture = false;
         self.long_last_frame_capture = now;
 
-        append_log(&format!(
+        append_long_log(&format!(
             "capture-due seq={} event_to_due_ms={} schedule_trailing={}",
             self.long_current_scroll_seq,
             now.saturating_duration_since(self.long_current_scroll_at)
                 .as_millis(),
             needs_trailing
         ));
-        let appended = self.append_long_screenshot_frame();
+        self.dispatch_long_capture_request(needs_trailing, trailing_due);
+    }
+
+    fn dispatch_long_capture_request(&mut self, needs_trailing: bool, trailing_due: Instant) {
+        let Some(source_region) = self.long_source_region.intersect(Rect {
+            x: 0,
+            y: 0,
+            w: self.screen_size.w,
+            h: self.screen_size.h,
+        }) else {
+            append_long_log("long-capture skipped: source region outside desktop");
+            self.finish_long_capture(false, needs_trailing, trailing_due);
+            return;
+        };
+        if self.long_stitcher.height() + source_region.h >= LONG_MAX_OUTPUT_HEIGHT {
+            self.long_auto_scroll_active = false;
+            self.finish_long_capture(false, needs_trailing, trailing_due);
+            return;
+        }
+
+        let request = LongCaptureRequest {
+            generation: self.long_capture_generation,
+            seq: self.long_current_scroll_seq,
+            desktop_bounds: self.bounds,
+            overlay_hwnd: self.hwnd.0 as isize,
+            region: source_region,
+        };
+
+        if let Some(worker) = &self.long_capture_worker {
+            if worker.request(request) {
+                self.long_capture_in_flight = true;
+                self.long_capture_in_flight_seq = request.seq;
+                self.long_capture_in_flight_needs_trailing = needs_trailing;
+                self.long_capture_in_flight_trailing_due = trailing_due;
+                return;
+            }
+        }
+
+        let frame = capture_region(request.desktop_bounds, request.region)
+            .or_else(|| capture_covered_window(request.desktop_bounds, self.hwnd, request.region));
+        let appended = frame
+            .map(|frame| self.append_long_screenshot_frame(frame))
+            .unwrap_or_else(|| {
+                append_long_log("long-capture failed");
+                false
+            });
+        self.finish_long_capture(appended, needs_trailing, trailing_due);
+    }
+
+    fn poll_long_capture_worker(&mut self) {
+        let responses = self
+            .long_capture_worker
+            .as_ref()
+            .map(LongCaptureWorker::drain_responses)
+            .unwrap_or_default();
+
+        for response in responses {
+            if !self.long_capture_in_flight
+                || response.generation != self.long_capture_generation
+                || response.seq != self.long_capture_in_flight_seq
+            {
+                continue;
+            }
+
+            self.long_capture_in_flight = false;
+            let needs_trailing = self.long_capture_in_flight_needs_trailing;
+            let trailing_due = self.long_capture_in_flight_trailing_due;
+            let appended = response
+                .frame
+                .map(|frame| self.append_long_screenshot_frame(frame))
+                .unwrap_or_else(|| {
+                    append_long_log("long-capture failed");
+                    false
+                });
+            self.finish_long_capture(appended, needs_trailing, trailing_due);
+        }
+    }
+
+    fn finish_long_capture(&mut self, appended: bool, needs_trailing: bool, trailing_due: Instant) {
         if appended {
             self.long_auto_stalls = 0;
             let render_check = Instant::now();
@@ -1311,7 +1500,7 @@ impl Application {
                 self.refresh_long_preview();
                 self.invalidate();
             } else {
-                append_log(&format!(
+                append_long_log(&format!(
                     "render-skip seq={} reason=auto-preview-throttle next_render_ms={}",
                     self.long_current_scroll_seq,
                     self.next_long_auto_preview_render
@@ -1325,7 +1514,7 @@ impl Application {
         if needs_trailing {
             if self.long_auto_scroll_active {
                 self.long_auto_stalls += 1;
-                append_log(&format!(
+                append_long_log(&format!(
                     "auto-scroll stall seq={} count={} reason=no-append-trailing-suppressed",
                     self.long_current_scroll_seq, self.long_auto_stalls
                 ));
@@ -1354,32 +1543,12 @@ impl Application {
         }
     }
 
-    fn append_long_screenshot_frame(&mut self) -> bool {
+    fn append_long_screenshot_frame(&mut self, mut frame: Image) -> bool {
         if !self.is_long_capture_active || self.long_source_region.w <= 0 {
             return false;
         }
-        let Some(source_region) = self.long_source_region.intersect(Rect {
-            x: 0,
-            y: 0,
-            w: self.screen_size.w,
-            h: self.screen_size.h,
-        }) else {
-            append_log("long-capture skipped: source region outside desktop");
-            return false;
-        };
-        if self.long_stitcher.height() + source_region.h >= LONG_MAX_OUTPUT_HEIGHT {
-            self.long_auto_scroll_active = false;
-            return false;
-        }
-
-        let frame = capture_covered_window(self.bounds, self.hwnd, source_region);
-
-        let Some(mut frame) = frame else {
-            append_log("long-capture failed");
-            return false;
-        };
         if frame.width != self.long_source_region.w {
-            append_log(&format!(
+            append_long_log(&format!(
                 "long-capture wrong width: got={} expected={}",
                 frame.width, self.long_source_region.w
             ));
@@ -1388,7 +1557,7 @@ impl Application {
         if self.long_current_scroll_seq != 0
             && self.long_last_appended_scroll_seq == self.long_current_scroll_seq
         {
-            append_log(&format!(
+            append_long_log(&format!(
                 "append skipped seq={} reason=same-scroll-already-appended",
                 self.long_current_scroll_seq
             ));
@@ -1401,7 +1570,7 @@ impl Application {
             .long_stitcher
             .append(&frame.pixels, frame.height, allow_acceptable_match);
         if !result.appended {
-            append_log(&format!(
+            append_long_log(&format!(
                 "long-scroll ignored: duplicate={} reliable={} allow_acceptable={} overlap={} score={:.2} second={:.2}",
                 result.duplicate,
                 result.reliable,
@@ -1413,7 +1582,7 @@ impl Application {
             return false;
         }
         self.long_last_appended_scroll_seq = self.long_current_scroll_seq;
-        append_log(&format!(
+        append_long_log(&format!(
             "long-append ok seq={} output={}x{} appended_rows={} overlap={} score={:.2}",
             self.long_current_scroll_seq,
             self.long_stitcher.width(),
@@ -1434,6 +1603,7 @@ impl Application {
             self.long_stitcher.height(),
             self.long_stitcher.pixels().to_vec(),
         );
+        self.update_long_preview_thumbnail();
         self.state_machine.set_selected_region(
             self.fit_long_preview_rect(self.long_stitcher.width(), self.long_stitcher.height()),
         );
@@ -1469,6 +1639,57 @@ impl Application {
         }
     }
 
+    fn long_thumbnail_rect_for(&self, image: &Image) -> Option<Rect> {
+        if self.long_source_region.w <= 0 || self.long_source_region.h <= 0 {
+            return None;
+        }
+        let source = self.long_source_region;
+        let available_h = (self.screen_size.h - 32).max(1);
+        let thumb_h = (source.h + 96).max(160).min(available_h);
+        let thumb_w = ((thumb_h as f32 * image.width as f32 / image.height.max(1) as f32).round()
+            as i32)
+            .clamp(72, 132);
+        let x = if source.x - thumb_w - 18 >= 8 {
+            source.x - thumb_w - 18
+        } else {
+            (source.x + source.w + 18).min(self.screen_size.w - thumb_w - 8)
+        };
+        let max_y = (self.screen_size.h - thumb_h - 8).max(8);
+        let y = (source.y + (source.h - thumb_h) / 2).clamp(8, max_y);
+        Some(Rect {
+            x,
+            y,
+            w: thumb_w,
+            h: thumb_h,
+        })
+    }
+
+    fn update_long_preview_thumbnail(&mut self) {
+        let Some(captured) = &self.captured else {
+            self.long_preview_thumbnail = None;
+            self.long_preview_thumbnail_rect = Rect::default();
+            return;
+        };
+        let Some(rect) = self.long_thumbnail_rect_for(captured) else {
+            self.long_preview_thumbnail = None;
+            self.long_preview_thumbnail_rect = Rect::default();
+            return;
+        };
+
+        let mut thumbnail = Image::new(rect.w, rect.h);
+        thumbnail.blit_scaled(
+            captured,
+            Rect {
+                x: 0,
+                y: 0,
+                w: rect.w,
+                h: rect.h,
+            },
+        );
+        self.long_preview_thumbnail = Some(thumbnail);
+        self.long_preview_thumbnail_rect = rect;
+    }
+
     fn long_screenshot_overlay_regions(&self) -> Vec<Rect> {
         let mut regions = Vec::new();
         if self.toolbar_w > 0.0 && self.toolbar_h > 0.0 {
@@ -1487,29 +1708,8 @@ impl Application {
             return regions;
         }
 
-        if let Some(captured) = &self.captured {
-            let source = self.long_source_region;
-            let available_h = (self.screen_size.h - 32).max(1);
-            let thumb_h = (source.h + 96).max(160).min(available_h);
-            let thumb_w = ((thumb_h as f32 * captured.width as f32 / captured.height.max(1) as f32)
-                .round() as i32)
-                .clamp(72, 132);
-            let x = if source.x - thumb_w - 18 >= 8 {
-                source.x - thumb_w - 18
-            } else {
-                (source.x + source.w + 18).min(self.screen_size.w - thumb_w - 8)
-            };
-            let max_y = (self.screen_size.h - thumb_h - 8).max(8);
-            let y = (source.y + (source.h - thumb_h) / 2).clamp(8, max_y);
-            regions.push(padded_rect(
-                Rect {
-                    x,
-                    y,
-                    w: thumb_w,
-                    h: thumb_h,
-                },
-                6,
-            ));
+        if self.long_preview_thumbnail.is_some() {
+            regions.push(padded_rect(self.long_preview_thumbnail_rect, 6));
         }
 
         regions
@@ -1628,52 +1828,25 @@ impl Application {
         frame.blend_rect(frame.bounds(), LONG_DIM_COLOR);
         let source = self.long_source_region;
         draw_selection_frame(frame, source, LONG_BORDER, LONG_BORDER);
-        if let Some(captured) = &self.captured {
-            let available_h = (self.screen_size.h - 32).max(1);
-            let thumb_h = (source.h + 96).max(160).min(available_h);
-            let thumb_w = ((thumb_h as f32 * captured.width as f32 / captured.height.max(1) as f32)
-                .round() as i32)
-                .clamp(72, 132);
-            let x = if source.x - thumb_w - 18 >= 8 {
-                source.x - thumb_w - 18
-            } else {
-                (source.x + source.w + 18).min(self.screen_size.w - thumb_w - 8)
-            };
-            let max_y = (self.screen_size.h - thumb_h - 8).max(8);
-            let y = (source.y + (source.h - thumb_h) / 2).clamp(8, max_y);
+        if let Some(thumbnail) = &self.long_preview_thumbnail {
+            let rect = self.long_preview_thumbnail_rect;
             frame.blend_rect(
                 Rect {
-                    x: x + 3,
-                    y: y + 3,
-                    w: thumb_w,
-                    h: thumb_h,
+                    x: rect.x + 3,
+                    y: rect.y + 3,
+                    w: rect.w,
+                    h: rect.h,
                 },
                 Color::rgba(0, 0, 0, 52),
             );
-            frame.blend_rect(
-                Rect {
-                    x,
-                    y,
-                    w: thumb_w,
-                    h: thumb_h,
-                },
-                LONG_PANEL,
-            );
-            frame.blit_scaled(
-                captured,
-                Rect {
-                    x,
-                    y,
-                    w: thumb_w,
-                    h: thumb_h,
-                },
-            );
+            frame.blend_rect(rect, LONG_PANEL);
+            frame.blit_scaled(thumbnail, rect);
             frame.draw_rect_outline(
                 Rect {
-                    x: x - 1,
-                    y: y - 1,
-                    w: thumb_w + 2,
-                    h: thumb_h + 2,
+                    x: rect.x - 1,
+                    y: rect.y - 1,
+                    w: rect.w + 2,
+                    h: rect.h + 2,
                 },
                 Color::rgba(255, 255, 255, 160),
                 1.0,
@@ -1981,6 +2154,12 @@ fn append_log(message: &str) {
         .open(path)
     {
         let _ = writeln!(file, "{:?} {}", std::time::SystemTime::now(), message);
+    }
+}
+
+fn append_long_log(message: &str) {
+    if ENABLE_LONG_CAPTURE_LOGS {
+        append_log(message);
     }
 }
 
