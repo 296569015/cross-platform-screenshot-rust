@@ -2,6 +2,10 @@ use cross_platform_screenshot_rust::core::{
     Annotation, AnnotationModel, AppEvent, AppState, FreehandAnnotation,
     LongScreenshotStitchOptions, LongScreenshotStitcher, ScreenshotStateMachine,
 };
+use cross_platform_screenshot_rust::longshot::{
+    trim_trailing_capture_dropout, LongShotAppendStatus, LongShotImage, LongShotRect,
+    LongShotSession, LongShotSessionOptions,
+};
 use cross_platform_screenshot_rust::platform::{Color, PointF};
 
 fn make_source_image(width: i32, height: i32) -> Vec<u8> {
@@ -239,6 +243,70 @@ fn long_screenshot_prefers_larger_overlap_when_scores_are_close() {
     assert!(result.appended);
     assert_eq!(result.overlap_rows, frame_height - scroll_rows);
     assert_eq!(result.appended_rows, scroll_rows);
+}
+
+#[test]
+fn longshot_session_wraps_start_and_append_flow() {
+    let width = 10;
+    let source_height = 28;
+    let frame_height = 12;
+    let source = make_source_image(width, source_height);
+    let stitch = LongScreenshotStitchOptions {
+        min_overlap_rows: 3,
+        max_overlap_rows: 11,
+        min_append_rows: 1,
+        reliable_match_score: 0.0,
+        ..Default::default()
+    };
+    let options = LongShotSessionOptions {
+        stitch,
+        trim_capture_dropout: false,
+        ..Default::default()
+    };
+    let first = LongShotImage::from_rgba(
+        width,
+        frame_height,
+        crop_rows(&source, width, 0, frame_height),
+    )
+    .unwrap();
+    let next = LongShotImage::from_rgba(
+        width,
+        frame_height,
+        crop_rows(&source, width, 7, frame_height),
+    )
+    .unwrap();
+
+    let mut session = LongShotSession::default();
+    session
+        .start(LongShotRect::new(0, 0, width, frame_height), first, options)
+        .unwrap();
+    let seq = session.next_scroll_seq();
+    let outcome = session.append_frame_for_scroll(seq, next);
+
+    assert_eq!(outcome.status, LongShotAppendStatus::Appended);
+    assert_eq!(outcome.stitch.overlap_rows, 5);
+    assert_eq!(session.height(), frame_height + 7);
+}
+
+#[test]
+fn longshot_trim_removes_black_capture_dropout_tail() {
+    let width = 10;
+    let height = 80;
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    for y in 0..40 {
+        for x in 0..width {
+            let i = (y as usize * width as usize + x as usize) * 4;
+            pixels[i] = 120;
+            pixels[i + 1] = 160;
+            pixels[i + 2] = 200;
+            pixels[i + 3] = 255;
+        }
+    }
+
+    let trimmed = trim_trailing_capture_dropout(&mut pixels, width, height);
+
+    assert_eq!(trimmed, 40);
+    assert_eq!(pixels.len(), width as usize * trimmed as usize * 4);
 }
 
 #[test]

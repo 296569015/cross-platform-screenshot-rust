@@ -140,6 +140,48 @@ impl Image {
         );
     }
 
+    pub fn draw_ellipse_outline(&mut self, rect: Rect, color: Color, thickness: f32) {
+        if rect.w <= 1 || rect.h <= 1 {
+            return;
+        }
+        let clipped = match rect.intersect(self.bounds()) {
+            Some(rect) => rect,
+            None => return,
+        };
+        let rx = rect.w as f32 * 0.5;
+        let ry = rect.h as f32 * 0.5;
+        if rx <= 0.5 || ry <= 0.5 {
+            return;
+        }
+        let cx = rect.x as f32 + rx;
+        let cy = rect.y as f32 + ry;
+        let t = thickness.max(1.0);
+        let inner_rx = (rx - t).max(0.0);
+        let inner_ry = (ry - t).max(0.0);
+
+        for y in clipped.y..clipped.bottom() {
+            for x in clipped.x..clipped.right() {
+                let dx = (x as f32 + 0.5 - cx) / rx;
+                let dy = (y as f32 + 0.5 - cy) / ry;
+                let outer = dx * dx + dy * dy;
+                if outer > 1.0 {
+                    continue;
+                }
+
+                if inner_rx <= 0.0 || inner_ry <= 0.0 {
+                    self.blend_pixel(x, y, color);
+                    continue;
+                }
+
+                let idx = (x as f32 + 0.5 - cx) / inner_rx;
+                let idy = (y as f32 + 0.5 - cy) / inner_ry;
+                if idx * idx + idy * idy >= 1.0 {
+                    self.blend_pixel(x, y, color);
+                }
+            }
+        }
+    }
+
     pub fn draw_line(&mut self, start: PointF, end: PointF, color: Color, thickness: f32) {
         let radius = (thickness.max(1.0) * 0.5).max(0.5);
         let min_x = start.x.min(end.x).floor() as i32 - radius.ceil() as i32 - 1;

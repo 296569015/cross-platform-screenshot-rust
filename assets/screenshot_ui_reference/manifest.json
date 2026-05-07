@@ -1,0 +1,125 @@
+{
+  "name": "screenshot_ui_reference",
+  "source_reference": "user-provided screenshot toolbar image",
+  "states": [
+    "normal",
+    "hover",
+    "down"
+  ],
+  "icon_size": 48,
+  "icon_layout": "icons/{state}/48/{name}.png",
+  "order": [
+    {
+      "name": "rectangle",
+      "label": "\u753b\u77e9\u5f62"
+    },
+    {
+      "name": "ellipse",
+      "label": "\u753b\u5706\u5f62"
+    },
+    {
+      "name": "text",
+      "label": "\u6dfb\u52a0\u6587\u5b57"
+    },
+    {
+      "name": "number",
+      "label": "\u6570\u5b57\u6807\u8bb0"
+    },
+    {
+      "name": "pen",
+      "label": "\u753b\u7b14"
+    },
+    {
+      "name": "arrow",
+      "label": "\u7bad\u5934"
+    },
+    {
+      "name": "line",
+      "label": "\u76f4\u7ebf"
+    },
+    {
+      "name": "dash",
+      "label": "\u865a\u7ebf"
+    },
+    {
+      "name": "mosaic",
+      "label": "\u9a6c\u8d5b\u514b"
+    },
+    {
+      "name": "gif",
+      "label": "GIF\u5f55\u5236"
+    },
+    {
+      "name": "pin",
+      "label": "\u9489\u5728\u684c\u9762"
+    },
+    {
+      "name": "ocr",
+      "label": "\u6587\u5b57\u63d0\u53d6"
+    },
+    {
+      "name": "longshot",
+      "label": "\u957f\u622a\u5c4f"
+    },
+    {
+      "name": "undo",
+      "label": "\u64a4\u56de"
+    },
+    {
+      "name": "save",
+      "label": "\u4fdd\u5b58"
+    },
+    {
+      "name": "cancel",
+      "label": "\u53d6\u6d88"
+    },
+    {
+      "name": "confirm",
+      "label": "\u5b8c\u6210"
+    }
+  ],
+  "reference_toolbar_order_without_longshot": [
+    "rectangle",
+    "ellipse",
+    "text",
+    "number",
+    "pen",
+    "arrow",
+    "line",
+    "dash",
+    "mosaic",
+    "gif",
+    "pin",
+    "ocr",
+    "undo",
+    "save",
+    "cancel",
+    "confirm"
+  ],
+  "toolbar_order_with_longshot": [
+    "rectangle",
+    "ellipse",
+    "text",
+    "number",
+    "pen",
+    "arrow",
+    "line",
+    "dash",
+    "mosaic",
+    "gif",
+    "pin",
+    "ocr",
+    "longshot",
+    "undo",
+    "save",
+    "cancel",
+    "confirm"
+  ],
+  "components": {
+    "toolbar_reference": "components/toolbar-reference.png",
+    "toolbar_with_longshot": "components/toolbar-with-longshot.png",
+    "style_panel": "components/style-panel.png"
+  },
+  "preview": "preview/screenshot-ui-reference-preview.png",
+  "state_sheet": "preview/icon-states-sheet.png"
+}
