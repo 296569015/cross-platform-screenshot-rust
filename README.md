@@ -25,7 +25,8 @@ The long-screenshot implementation is isolated under `src/longshot/`:
 
 - `stitcher.rs`: pure RGBA overlap detection and stitching
 - `session.rs`: screenshot-tool friendly session wrapper
-- `windows.rs`: optional Win32 capture, covered-window fallback, wheel forwarding, and worker thread
+- `runtime.rs`: one-call Windows runtime for capture, wheel forwarding, background stitching, auto-scroll, and export
+- `windows.rs`: Win32 capture, covered-window fallback, wheel forwarding, and worker thread
 
 Integration notes for moving this feature into another Rust/Windows screenshot tool are in
 [`docs/long_screenshot_integration.md`](docs/long_screenshot_integration.md).

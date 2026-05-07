@@ -1,40 +1,43 @@
-# 长截屏能力剥离与集成指南
+# 长截屏接入指南
 
-本文档给公司截图工具接入长截屏使用。目标是让模型或开发同学尽量少理解原项目 UI，直接复制 `src/longshot/`，再把几个调用点接到现有 Win32 截图流程里。
+这份文档给你接入长截屏用。你不用自己写截屏、滚轮转发、窗口查找、后台捕获和拼接逻辑；这些都已经包在 `src/longshot/` 里了。
 
-## 1. 先复制哪些文件
+你要做的事情只有三件：
 
-把本项目整个目录复制到公司项目：
+1. 复制 `src/longshot/`
+2. 在点击“长截屏”按钮时调用 `LongShotRuntime::start(...)`
+3. 在窗口 timer 和鼠标滚轮消息里把事件转给 `LongShotRuntime`
+
+最终导出时调用 `finish_for_export(...)`，拿到的就是完整长图 RGBA。
+
+## 1. 复制文件
+
+把整个目录复制过去：
 
 ```text
 src/longshot/
   mod.rs
-  types.rs
-  stitcher.rs
+  runtime.rs
   session.rs
+  stitcher.rs
+  types.rs
   windows.rs
 ```
 
-在公司项目 `lib.rs` 或 `main.rs` 的模块声明处加：
+然后在 `lib.rs` 或 `main.rs` 里声明：
 
 ```rust
 pub mod longshot;
 ```
 
-如果公司项目只想复用拼接算法，并继续用自己的截屏和滚轮转发代码，可以不复制 `windows.rs`，但要同时删掉 `mod.rs` 里的这一行：
+`LongShotRuntime` 是你优先使用的入口。其他文件只是它内部用的拆分模块。
 
-```rust
-#[cfg(windows)]
-pub mod windows;
-```
+## 2. 依赖
 
-## 2. 依赖要求
-
-纯拼接与会话层只用 Rust 标准库，不依赖 `image`、`rayon`、`GDI+`。
-
-如果使用 `src/longshot/windows.rs`，`Cargo.toml` 里 `windows` 依赖需要包含这些 feature：
+`LongShotRuntime` 会使用 `windows.rs` 里的 Win32 捕获和滚轮转发，所以 `Cargo.toml` 里需要这些 feature：
 
 ```toml
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -44,525 +47,343 @@ windows = { version = "0.59", features = [
 ] }
 ```
 
-本项目为了兼容原代码，在 `lib.rs` 里用了：
+本项目里为了兼容旧代码写的是：
 
 ```rust
 #[cfg(windows)]
 extern crate windows as windows_api;
 ```
 
-如果公司项目直接叫 `windows`，把 `src/longshot/windows.rs` 中所有 `crate::windows_api::...` 替换成 `windows::...` 即可。
-
-## 3. 数据格式约定
-
-长截屏模块只认一种图片格式：
+所以 `src/longshot/windows.rs` 里引用的是：
 
 ```rust
-LongShotImage {
-    width: i32,
-    height: i32,
-    pixels: Vec<u8>, // RGBA, top-down, 长度 = width * height * 4
-}
+crate::windows_api::...
 ```
 
-如果公司项目已有 `Image` 类型，比如：
+如果你的工程里没有 `windows_api` 这个别名，二选一：
 
 ```rust
-struct Image {
-    width: i32,
-    height: i32,
-    pixels: Vec<u8>,
-}
+#[cfg(windows)]
+extern crate windows as windows_api;
 ```
 
-写两个转换函数即可：
+或者把 `src/longshot/windows.rs` 里的 `crate::windows_api::` 全部替换成 `windows::`。
 
-```rust
-fn to_longshot_image(img: &Image) -> longshot::LongShotImage {
-    longshot::LongShotImage {
-        width: img.width,
-        height: img.height,
-        pixels: img.pixels.clone(),
-    }
-}
+## 3. 一句话理解接口
 
-fn from_longshot_image(img: longshot::LongShotImage) -> Image {
-    Image {
-        width: img.width,
-        height: img.height,
-        pixels: img.pixels,
-    }
-}
-```
-
-坐标约定：
-
-```rust
-LongShotRect { x, y, w, h }
-```
-
-`x/y` 是相对“全虚拟桌面截图”的坐标。多屏时虚拟桌面左上角可能不是 `(0, 0)`，Win32 捕获时需要加上 `desktop_bounds.x/y`。
-
-## 4. 模块职责
-
-`types.rs`
-
-基础类型：`LongShotRect`、`LongShotPoint`、`LongShotImage`。
-
-`stitcher.rs`
-
-核心拼接算法。输入连续帧 RGBA，自动寻找重叠区，输出拼接后的 RGBA。
-
-`session.rs`
-
-给截图工具用的推荐封装。负责：
-
-- 根据选区高度生成默认拼接参数
-- 保存长截屏会话状态
-- 防止同一次滚动重复追加
-- 裁掉 Win32 捕获偶发的底部黑色掉帧
-- 输出最终长图
-
-`windows.rs`
-
-可选 Win32 适配层。负责：
-
-- GDI `BitBlt` 区域捕获
-- `PrintWindow(PW_RENDERFULLCONTENT)` 兜底捕获被遮挡窗口
-- 向底层窗口投递 `WM_MOUSEWHEEL`
-- 后台捕获线程 `LongShotCaptureWorker`
-
-## 5. 在公司架构里的落点
-
-按你们现有架构，推荐这样接：
-
-```text
-select_border.rs
-  增加 LongScreenshot 工具栏按钮
-
-windlg.rs
-  保存 LongShotSession
-  处理长截屏按钮点击、滚轮、timer、后台捕获结果
-
-dc_control.rs
-  如果不用 longshot::windows.rs，就把现有 GDI/GDI+ 截图函数封装成 LongShotImage
-
-uibase.rs
-  不需要理解长截屏算法，只负责按钮和预览 UI
-```
-
-## 6. windlg.rs 需要新增的状态
-
-在主窗口状态结构里加这些字段：
+你只跟这个对象打交道：
 
 ```rust
 use crate::longshot::{
-    LongShotAppendStatus, LongShotImage, LongShotPoint, LongShotRect,
-    LongShotSession, LongShotSessionOptions,
+    LongShotPoint, LongShotRect, LongShotRuntime, LongShotRuntimeEvent,
 };
 
-#[cfg(windows)]
-use crate::longshot::windows::{
-    LongShotCaptureRequest, LongShotCaptureResponse, LongShotCaptureWorker,
-};
-
-struct WindlgState {
-    longshot: LongShotSession,
-    longshot_active: bool,
-    longshot_source_region: LongShotRect,
-    longshot_generation: u64,
-    longshot_capture_worker: Option<LongShotCaptureWorker>,
-    longshot_capture_in_flight: bool,
-    longshot_pending_seq: u64,
-    longshot_last_scroll_target: isize,
-    longshot_auto_scroll: bool,
-    longshot_auto_stalls: i32,
+struct AppState {
+    longshot: LongShotRuntime,
 }
 ```
 
 初始化：
 
 ```rust
-let state = WindlgState {
-    longshot: LongShotSession::default(),
-    longshot_active: false,
-    longshot_source_region: LongShotRect::default(),
-    longshot_generation: 0,
-    longshot_capture_worker: LongShotCaptureWorker::spawn(),
-    longshot_capture_in_flight: false,
-    longshot_pending_seq: 0,
-    longshot_last_scroll_target: 0,
-    longshot_auto_scroll: false,
-    longshot_auto_stalls: 0,
-};
+let longshot = LongShotRuntime::default();
 ```
 
-## 7. 点击长截屏按钮时启动会话
-
-在 `select_border.rs` 的工具栏命令里加：
+点击长截屏按钮时：
 
 ```rust
-LongScreenshot,
+let event = self.longshot.start(
+    desktop_bounds,
+    self.hwnd.0 as isize,
+    selected_region,
+)?;
 ```
 
-在 `windlg.rs` 的工具栏点击处理里：
+鼠标滚轮时：
 
 ```rust
-ToolbarCommand::LongScreenshot => {
-    self.start_longshot();
+self.longshot.handle_manual_wheel(screen_point, wheel_delta);
+```
+
+窗口 timer 时：
+
+```rust
+for event in self.longshot.tick() {
+    self.handle_longshot_event(event);
 }
 ```
 
-实现 `start_longshot`：
+保存或复制时：
+
+```rust
+let image = self.longshot.finish_for_export(Duration::from_millis(500));
+```
+
+## 4. 数据格式
+
+长截屏输出是 RGBA、top-down：
+
+```rust
+LongShotImage {
+    width: i32,
+    height: i32,
+    pixels: Vec<u8>, // RGBA, width * height * 4
+}
+```
+
+选区和桌面范围都用：
+
+```rust
+LongShotRect { x, y, w, h }
+```
+
+注意：`selected_region` 是相对虚拟桌面的坐标。多屏时虚拟桌面左上角可能不是 `(0, 0)`。
+
+你可以这样取虚拟桌面范围：
+
+```rust
+fn virtual_desktop_bounds() -> LongShotRect {
+    unsafe {
+        LongShotRect {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            w: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        }
+    }
+}
+```
+
+## 5. 点击长截屏按钮
+
+当你的普通截图流程已经让用户框选出一个区域后，在“长截屏”按钮点击处调用：
 
 ```rust
 fn start_longshot(&mut self) -> bool {
-    let selected = self.current_selected_region(); // 公司项目已有选区
-    if selected.w <= 0 || selected.h <= 0 {
-        return false;
-    }
+    let desktop_bounds = self.virtual_desktop_bounds();
+    let selected = self.current_selected_region();
+    let selected = LongShotRect::new(selected.x, selected.y, selected.w, selected.h);
 
-    let Some(full_capture) = self.current_full_desktop_image() else {
-        return false;
+    let event = match self.longshot.start(
+        desktop_bounds,
+        self.hwnd.0 as isize,
+        selected,
+    ) {
+        Ok(event) => event,
+        Err(_) => return false,
     };
 
-    let source = LongShotRect::new(selected.x, selected.y, selected.w, selected.h);
-    let full = LongShotImage {
-        width: full_capture.width,
-        height: full_capture.height,
-        pixels: full_capture.pixels.clone(),
-    };
+    self.apply_longshot_event(event);
 
-    let options = LongShotSessionOptions::tuned_for_region_height(source.h);
-    if self.longshot.start_from_full_capture(source, &full, options).is_err() {
-        return false;
-    }
-
-    self.longshot_active = true;
-    self.longshot_source_region = source;
-    self.longshot_generation = self.longshot_generation.saturating_add(1);
-    self.longshot_capture_in_flight = false;
-    self.longshot_pending_seq = 0;
-    self.longshot_last_scroll_target = 0;
-    self.longshot_auto_scroll = false;
-    self.longshot_auto_stalls = 0;
-
-    let preview = self.longshot.output_image().unwrap();
-    self.show_longshot_preview(preview);
-
-    // 关键：让选区内部可以把滚轮给到底层窗口。
-    // 如果你们的分层窗口支持穿透，就把 source 设置成穿透区域。
-    self.set_passthrough_region(source);
+    // 建议：长截屏期间让选区内部鼠标穿透。
+    // Runtime 会自己找到浮层下面的真实窗口并投递滚轮。
+    self.set_passthrough_region(selected);
 
     true
 }
 ```
 
-## 8. 处理用户手动滚轮
+`start(...)` 会自己做第一帧捕获，不需要你提前把全屏截图传进来。
 
-长截屏只处理向下滚动。收到鼠标滚轮后：
+## 6. 处理 Runtime 事件
+
+Runtime 会通过事件告诉你什么时候刷新预览、什么时候停止自动滚动：
+
+```rust
+fn apply_longshot_event(&mut self, event: LongShotRuntimeEvent) {
+    match event {
+        LongShotRuntimeEvent::Started { image } |
+        LongShotRuntimeEvent::PreviewUpdated { image, .. } => {
+            self.show_longshot_preview(image);
+        }
+        LongShotRuntimeEvent::AutoScrollStopped |
+        LongShotRuntimeEvent::MaxOutputHeightReached => {
+            self.update_longshot_toolbar_state();
+        }
+        LongShotRuntimeEvent::FrameIgnored { .. } |
+        LongShotRuntimeEvent::CaptureFailed { .. } => {}
+    }
+}
+```
+
+`show_longshot_preview(image)` 由你的 UI 实现：把长图缩放显示到选区附近，或者直接替换当前预览图都可以。
+
+## 7. 鼠标滚轮
+
+收到 `WM_MOUSEWHEEL` 时，把屏幕坐标和滚轮值交给 Runtime：
 
 ```rust
 fn on_mouse_wheel(&mut self, wheel_delta: i32, screen_x: i32, screen_y: i32) {
-    if !self.longshot_active || wheel_delta >= 0 {
-        return;
-    }
-
-    let seq = self.longshot.next_scroll_seq();
-    self.longshot_pending_seq = seq;
-
     let screen_point = LongShotPoint {
         x: screen_x,
         y: screen_y,
     };
 
-    let ok = crate::longshot::windows::post_mouse_wheel_at(
-        screen_point,
-        wheel_delta,
-        self.hwnd.0 as isize,
-        &mut self.longshot_last_scroll_target,
-    );
-    if !ok {
-        return;
-    }
-
-    // 建议 35-80ms 后截下一帧，太早页面还没滚完。
-    self.set_timer_after_ms(50, TimerKind::LongShotCapture);
-}
-```
-
-如果公司项目已经用低级鼠标钩子把滚轮直接放给底层窗口，那么无需 `post_mouse_wheel_at`，只需要在观察到选区内有向下滚轮时调用：
-
-```rust
-let seq = self.longshot.next_scroll_seq();
-self.longshot_pending_seq = seq;
-self.set_timer_after_ms(28, TimerKind::LongShotCapture);
-```
-
-## 9. 到时间后截取下一帧
-
-推荐用后台线程，避免 UI 卡顿：
-
-```rust
-fn request_longshot_capture(&mut self) {
-    if self.longshot_capture_in_flight {
-        return;
-    }
-
-    let desktop_bounds = self.virtual_desktop_bounds_as_longshot_rect();
-    let region = self.longshot_source_region;
-
-    if !self.longshot.can_accept_frame_height(region.h) {
-        self.longshot_auto_scroll = false;
-        return;
-    }
-
-    let request = LongShotCaptureRequest {
-        generation: self.longshot_generation,
-        seq: self.longshot_pending_seq,
-        desktop_bounds,
-        overlay_hwnd: self.hwnd.0 as isize,
-        region,
-    };
-
-    if let Some(worker) = &self.longshot_capture_worker {
-        if worker.request(request) {
-            self.longshot_capture_in_flight = true;
-            return;
-        }
-    }
-
-    // 没有 worker 时走同步兜底。
-    let frame = crate::longshot::windows::capture_region_or_covered_window(
-        request.desktop_bounds,
-        request.overlay_hwnd,
-        request.region,
-    );
-    self.handle_longshot_frame(request.generation, request.seq, frame);
-}
-```
-
-轮询 worker：
-
-```rust
-fn poll_longshot_worker(&mut self) {
-    let responses = self
-        .longshot_capture_worker
-        .as_ref()
-        .map(LongShotCaptureWorker::drain_responses)
-        .unwrap_or_default();
-
-    for response in responses {
-        self.handle_longshot_frame(response.generation, response.seq, response.frame);
+    if self.longshot.handle_manual_wheel(screen_point, wheel_delta) {
+        self.ensure_timer_running();
     }
 }
 ```
 
-处理帧：
+`handle_manual_wheel(...)` 内部会做这些事：
+
+- 找到截图浮层下面的真实窗口
+- 投递 `WM_MOUSEWHEEL`
+- 延迟约 50ms 后安排下一帧捕获
+- 后台捕获选区
+- 调拼接算法
+- 在 `tick()` 里返回预览更新事件
+
+你不要再额外写一套滚轮转发。
+
+## 8. Timer
+
+长截屏开始后，保持一个短周期 timer，例如 15-30ms：
 
 ```rust
-fn handle_longshot_frame(
-    &mut self,
-    generation: u64,
-    seq: u64,
-    frame: Option<LongShotImage>,
-) {
-    if generation != self.longshot_generation {
-        return;
-    }
-    self.longshot_capture_in_flight = false;
-
-    let Some(frame) = frame else {
-        self.longshot_auto_stalls += 1;
-        return;
-    };
-
-    let outcome = self.longshot.append_frame_for_scroll(seq, frame);
-    match outcome.status {
-        LongShotAppendStatus::Appended => {
-            self.longshot_auto_stalls = 0;
-            let preview = self.longshot.output_image().unwrap();
-            self.show_longshot_preview(preview);
-        }
-        LongShotAppendStatus::Duplicate | LongShotAppendStatus::Rejected => {
-            self.longshot_auto_stalls += 1;
-        }
-        LongShotAppendStatus::TooTall => {
-            self.longshot_auto_scroll = false;
-        }
-        _ => {}
-    }
-
-    if self.longshot_auto_stalls >= 5 {
-        self.longshot_auto_scroll = false;
+fn on_timer(&mut self) {
+    for event in self.longshot.tick() {
+        self.apply_longshot_event(event);
     }
 }
 ```
 
-## 10. 自动滚动
+`tick()` 会自动处理：
 
-自动滚动按钮建议只在长截屏模式下显示。
+- 后台捕获线程结果
+- 手动滚轮后的延迟捕获
+- 自动滚动
+- 连续无新增内容后停止
+- 输出高度上限
 
-点击自动滚动按钮：
+## 9. 自动滚动
+
+自动滚动按钮只需要切 Runtime 状态：
 
 ```rust
 fn toggle_longshot_auto_scroll(&mut self) {
-    if !self.longshot_active {
-        return;
-    }
-    self.longshot_auto_scroll = !self.longshot_auto_scroll;
-    self.longshot_auto_stalls = 0;
-    if self.longshot_auto_scroll {
-        self.set_timer_after_ms(1, TimerKind::LongShotAutoScroll);
-    }
+    let active = self.longshot.toggle_auto_scroll();
+    self.set_auto_scroll_button_active(active);
+    self.ensure_timer_running();
 }
 ```
 
-timer 中执行：
+或者明确开启/关闭：
 
 ```rust
-fn run_longshot_auto_scroll(&mut self) {
-    if !self.longshot_auto_scroll || !self.longshot_active {
-        return;
+self.longshot.set_auto_scroll(true);
+self.longshot.set_auto_scroll(false);
+```
+
+自动滚动内部使用 `windows.rs` 投递滚轮，默认每 120ms 滚一次，每次约 `-40` wheel delta。连续 5 次没有拼接出新内容会自动停止。
+
+## 10. 保存和复制
+
+保存、复制、贴图前调用：
+
+```rust
+fn export_longshot(&mut self) -> Option<LongShotImage> {
+    self.longshot.finish_for_export(Duration::from_millis(500))
+}
+```
+
+`finish_for_export(...)` 会：
+
+- 关闭自动滚动
+- 等待正在进行的后台捕获
+- 再补抓一次当前选区
+- 返回最终长图
+
+导出 PNG 或写剪贴板时直接用返回的 RGBA：
+
+```rust
+let image = self.export_longshot()?;
+save_png_or_copy_clipboard(image.pixels, image.width, image.height);
+```
+
+如果你有标注功能，长截图导出时建议把标注按长图坐标 `(0, 0)` 绘制。
+
+## 11. 你需要提供的 UI 能力
+
+Runtime 已经包含捕获、滚轮、窗口查找和拼接。你只需要在 UI 层提供这些薄接口：
+
+```rust
+fn current_selected_region(&self) -> Rect;
+fn virtual_desktop_bounds(&self) -> LongShotRect;
+fn set_passthrough_region(&mut self, region: LongShotRect);
+fn show_longshot_preview(&mut self, image: LongShotImage);
+fn ensure_timer_running(&mut self);
+fn save_png_or_copy_clipboard(&mut self, pixels: Vec<u8>, width: i32, height: i32);
+```
+
+其中最重要的是 `set_passthrough_region`：长截屏时选区内部最好允许鼠标穿透，否则底层窗口可能收不到真实滚轮。不过即使浮层挡住，Runtime 也会用 `WindowFromPoint` + 排除 overlay 的方式去找下面窗口并投递滚轮。
+
+## 12. 最小接入骨架
+
+```rust
+use std::time::Duration;
+use crate::longshot::{
+    LongShotImage, LongShotPoint, LongShotRect, LongShotRuntime, LongShotRuntimeEvent,
+};
+
+struct App {
+    hwnd: HWND,
+    longshot: LongShotRuntime,
+}
+
+impl App {
+    fn on_longshot_button(&mut self) {
+        let desktop = self.virtual_desktop_bounds();
+        let selected = self.selected_region_as_longshot_rect();
+
+        if let Ok(event) = self.longshot.start(desktop, self.hwnd.0 as isize, selected) {
+            self.apply_longshot_event(event);
+            self.set_passthrough_region(selected);
+            self.ensure_timer_running();
+        }
     }
 
-    let source = self.longshot_source_region;
-    let screen_point = LongShotPoint {
-        x: self.desktop_origin_x + source.x + source.w / 2,
-        y: self.desktop_origin_y + source.y + source.h / 2,
-    };
+    fn on_mouse_wheel(&mut self, wheel_delta: i32, screen_x: i32, screen_y: i32) {
+        let point = LongShotPoint { x: screen_x, y: screen_y };
+        if self.longshot.handle_manual_wheel(point, wheel_delta) {
+            self.ensure_timer_running();
+        }
+    }
 
-    let wheel_delta = -40; // 约等于 -0.33 个滚轮格
-    let ok = crate::longshot::windows::post_mouse_wheel_at(
-        screen_point,
-        wheel_delta,
-        self.hwnd.0 as isize,
-        &mut self.longshot_last_scroll_target,
-    );
+    fn on_timer(&mut self) {
+        for event in self.longshot.tick() {
+            self.apply_longshot_event(event);
+        }
+    }
 
-    if ok {
-        let seq = self.longshot.next_scroll_seq();
-        self.longshot_pending_seq = seq;
-        self.set_timer_after_ms(45, TimerKind::LongShotCapture);
-        self.set_timer_after_ms(120, TimerKind::LongShotAutoScroll);
-    } else {
-        self.longshot_auto_stalls += 1;
-        if self.longshot_auto_stalls >= 5 {
-            self.longshot_auto_scroll = false;
+    fn on_auto_scroll_button(&mut self) {
+        self.longshot.toggle_auto_scroll();
+        self.ensure_timer_running();
+    }
+
+    fn on_save(&mut self) {
+        if let Some(image) = self.longshot.finish_for_export(Duration::from_millis(500)) {
+            self.save_png(image.pixels, image.width, image.height);
+        }
+    }
+
+    fn apply_longshot_event(&mut self, event: LongShotRuntimeEvent) {
+        match event {
+            LongShotRuntimeEvent::Started { image } |
+            LongShotRuntimeEvent::PreviewUpdated { image, .. } => {
+                self.show_longshot_preview(image);
+            }
+            _ => {}
         }
     }
 }
 ```
 
-## 11. 保存、复制、贴图
+## 13. 常见问题
 
-保存前先等正在进行的捕获结束，再取最终图片：
-
-```rust
-fn longshot_output_for_export(&mut self) -> Option<LongShotImage> {
-    self.longshot_auto_scroll = false;
-    self.poll_longshot_worker();
-
-    // 如果你们有 worker.wait_for_response，可以等 300-500ms。
-    // 不等也可以，只是最后一次滚动可能来不及拼进去。
-
-    self.longshot.output_image()
-}
-```
-
-导出长图时，标注坐标建议相对长图 `(0, 0)` 绘制：
-
-```rust
-let mut image = self.longshot_output_for_export()?;
-for annotation in self.annotations.iter() {
-    draw_annotation(&mut image, annotation, 0, 0);
-}
-save_png_or_copy_clipboard(image.pixels, image.width, image.height);
-```
-
-普通截图仍然按原逻辑：先按选区 crop，再按选区 origin 绘制标注。
-
-## 12. 如果不用 windows.rs，如何接 dc_control.rs
-
-公司项目已有 `dc_control.rs` 和 GDI+。只要提供这两个函数即可：
-
-```rust
-fn capture_longshot_frame(region: LongShotRect) -> Option<LongShotImage> {
-    let image = dc_control::capture_region(region.x, region.y, region.w, region.h)?;
-    Some(LongShotImage {
-        width: image.width,
-        height: image.height,
-        pixels: image.pixels,
-    })
-}
-
-fn scroll_under_cursor(screen_x: i32, screen_y: i32, wheel_delta: i32) -> bool {
-    // 可以复用公司项目已有鼠标消息转发。
-    // 要点：目标窗口必须是截图浮层下面的真实窗口。
-    true
-}
-```
-
-然后继续使用 `LongShotSession` 做拼接。
-
-## 13. 关键参数说明
-
-默认调参入口：
-
-```rust
-LongShotSessionOptions::tuned_for_region_height(selected.h)
-```
-
-内部参数含义：
-
-```rust
-min_overlap_rows       // 两帧至少要匹配多少行
-max_overlap_rows       // 最大搜索重叠行数
-min_append_rows        // 每次至少新增多少行，小于它按重复帧处理
-duplicate_score        // 整帧重复阈值
-reliable_match_score   // 可靠匹配阈值，越小越严格
-acceptable_match_score // 可接受匹配阈值
-ambiguous_score_gap    // 第一名和第二名差距太小时认为有歧义
-max_output_height      // 默认 16000，防止无限滚动吃内存
-```
-
-建议先不改参数。只有遇到特定网页拼接失败，再调：
-
-- 拼不上：略微增大 `acceptable_match_score`
-- 重复区域被拼进去：增大 `min_append_rows`
-- 重复纹理页面错位：增大 `ambiguous_score_gap`，或把 `append_on_unreliable_match` 设为 `false`
-
-## 14. 常见坑
-
-1. RGBA 顺序错了会导致匹配分数异常。GDI DIB 通常是 BGRA，必须转成 RGBA。
-2. `LongShotRect` 是相对虚拟桌面的选区，调用 Win32 `BitBlt` 时要加 `desktop_bounds.x/y`。
-3. 截图浮层如果挡住选区，底层窗口收不到滚轮。要么设置选区穿透，要么用 `post_mouse_wheel_at` 找到浮层下面的窗口并投递滚轮。
-4. 滚动后不要立刻截图，建议延迟 35-80ms。
-5. 自动滚动必须设置失败上限，连续 5 次没有追加就停。
-6. 导出前最好 flush 一次正在飞行的捕获请求，否则最后一次滚动可能没进最终长图。
-
-## 15. 最小主流程
-
-```rust
-// 1. 启动
-let first = full_capture.crop(selected).unwrap();
-let options = LongShotSessionOptions::tuned_for_region_height(selected.h);
-longshot.start(selected, first, options).unwrap();
-
-// 2. 每次向下滚轮
-let seq = longshot.next_scroll_seq();
-post_or_forward_wheel(...);
-delay_50ms_then_capture_region(selected);
-
-// 3. 捕获返回
-let outcome = longshot.append_frame_for_scroll(seq, frame);
-if outcome.appended() {
-    let preview = longshot.output_image().unwrap();
-    show_preview(preview);
-}
-
-// 4. 保存
-let final_image = longshot.output_image().unwrap();
-save_png(final_image.pixels, final_image.width, final_image.height);
-```
+1. 图片必须是 RGBA。`windows.rs` 已经把 GDI 的 BGRA 转成 RGBA。
+2. `desktop_bounds` 必须是虚拟桌面坐标，不要只传主屏 `(0, 0, 1920, 1080)`。
+3. 滚动后不要立刻截图。Runtime 默认延迟 50ms。
+4. 自动滚动必须跑 timer。只开启状态但不调用 `tick()`，它不会继续工作。
+5. 如果你隐藏 overlay 后再保存，先调用 `finish_for_export(...)`，否则最后一帧可能还在后台线程里。
 

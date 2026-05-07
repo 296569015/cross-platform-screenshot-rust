@@ -3,10 +3,16 @@
 //! Copy this folder into another Rust screenshot tool when you want the
 //! long-screenshot capability without dragging in this demo application's UI.
 
+#[cfg(windows)]
+mod runtime;
 mod session;
 mod stitcher;
 mod types;
 
+#[cfg(windows)]
+pub use runtime::{
+    LongShotRuntime, LongShotRuntimeConfig, LongShotRuntimeError, LongShotRuntimeEvent,
+};
 pub use session::{
     trim_image_trailing_capture_dropout, trim_trailing_capture_dropout, LongShotAppendOutcome,
     LongShotAppendStatus, LongShotSession, LongShotSessionOptions, LongShotStartError,
